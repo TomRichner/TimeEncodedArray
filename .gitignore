@@ -1,5 +1,20 @@
-.env
-.mat
-.hdf
-.h5
+# MATLAB
+*.asv
+*.m~
 
+# Data files (never commit)
+*.mat
+*.hdf5
+*.h5
+*.nrd
+*.nsd
+*.med
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
