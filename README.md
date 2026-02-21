@@ -5,33 +5,30 @@ A standardized timeseries data format built on HDF5/`.mat` v7.3 files. Designed 
 ## Quick Start (MATLAB)
 
 ```matlab
-% Add to path
 addpath('matlab');
 
-% --- Write ---
-SR = 1000;
-t = (0:4999)' / SR;
-Samples = randn(5000, 3);
-brew_TEA('data.mat', t, Samples, SR, true, 't_units', 's', 'ch_map', [1 2 3]);
+% --- Create and write ---
+tea = TEA('data.mat', 1000, true, 't_units', 's');
+tea.write(t, Samples);                % creates file on first call
+
+% --- Append ---
+tea.write(t2, Samples2);             % appends in time (no SR/mode needed)
+tea.write_channels(new_data, [5 6]); % appends channels
 
 % --- Read ---
-[Data, t_out, disc_info] = drink_TEA('data.mat', [1 3], [1.0, 2.0], []);
-% disc_info.is_discontinuous, disc_info.cont, disc_info.disc
+[Data, t_out, disc_info] = tea.read([1 3], [1.0, 2.0], []);
 
-% --- Append in time ---
-t2 = t(end) + (1:5000)' / SR;
-brew_TEA('data.mat', t2, randn(5000,3), SR, true, 'mode', 'append_time');
+% --- Info ---
+s = tea.info();   % .N, .C, .SR, .isContinuous, ...
 
-% --- Append channels ---
-brew_TEA('data.mat', [], randn(10000,2), SR, true, 'mode', 'append_channels');
-
-% --- Repair missing metadata ---
-refresh_TEA('data.mat');
+% --- Re-open existing file ---
+tea2 = TEA('data.mat', 1000, true);  % validates SR/isRegular match
+tea2.write(t3, s3);                  % appends
 ```
 
 ## Schema
 
-Each TEA file contains **one time axis** (`t`) and one primary data matrix (`Samples`). See [schema/tea_schema.md](schema/tea_schema.md) for the full specification.
+See [schema/tea_schema.md](schema/tea_schema.md) for the full specification.
 
 ### Required
 
@@ -44,27 +41,31 @@ Each TEA file contains **one time axis** (`t`) and one primary data matrix (`Sam
 
 ### Dependent (auto-computed)
 
-`t_coarse`, `df_t_coarse`, `isContinuous`, `cont`, `disc` — computed by `brew_TEA` and `refresh_TEA`.
+`t_coarse`, `df_t_coarse`, `isContinuous`, `cont`, `disc`
 
 ### Optional
 
-`t_units`, `ch_map`, `SR_original`, `hdr`, `tea_version`, plus any user-defined fields.
+`t_units`, `ch_map`, `SR_original`, `hdr`, `tea_version`
 
-## Functions
+## Class API
 
-| Function | Description |
+| Method | Description |
+|--------|-------------|
+| `TEA(path, SR, isRegular, ...)` | Constructor — binds to file |
+| `write(t, Samples)` | Create or append time-series data |
+| `write_channels(Samples, ch_map)` | Append new channels |
+| `read(channels, t_range, s_range)` | Read with optional ranges and channel selection |
+| `refresh()` | Recompute dependent variables |
+| `info()` | Return metadata summary struct |
+
+| Property | Description |
 |----------|-------------|
-| `brew_TEA` | Create or append to a TEA file |
-| `drink_TEA` | Read data with optional time/sample range and channel selection |
-| `refresh_TEA` | Compute/add missing dependent variables |
-
-## Discontinuity Model
-
-For regularly sampled data (`isRegular = true`), a discontinuity is any `diff(t) > 1.1/SR`. When gaps exist:
-- `cont`: `[n_cont × 2]` matrix of `[start_idx, stop_idx]` for each continuous block
-- `disc`: `[n_disc × 2]` matrix of `[last_before_gap, first_after_gap]` for each gap
-
-The reader (`drink_TEA`) also detects discontinuities in the returned segment and provides local `cont`/`disc` arrays via the `disc_info` output.
+| `file_path` | Bound file path (immutable) |
+| `SR` | Sample rate (immutable) |
+| `isRegular` | Regularity flag (immutable) |
+| `N` | Total samples (read from file) |
+| `C` | Total channels (read from file) |
+| `ch_map` | Channel map (read from file) |
 
 ## License
 

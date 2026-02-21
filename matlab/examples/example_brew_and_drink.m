@@ -1,132 +1,49 @@
-%% Example: Brew and Drink TEA files
-% Demonstrates creating, reading, appending, and inspecting TEA files.
+%% example_tea.m — End-to-end demo of the TEA class
+%
+% Demonstrates: create, read, append, discontinuity handling, refresh.
 
-%% Setup
-% Add the TEA matlab directory to the path
-tea_dir = fileparts(fileparts(mfilename('fullpath'))); % go up from examples/ to matlab/
-addpath(tea_dir);
+%% 1. Create a TEA file with regular continuous data
+SR = 1000;
+t = (0:4999)' / SR;
+Samples = randn(5000, 3);
 
-% Temporary file for this example
-temp_file = fullfile(tempdir, 'tea_example.mat');
-if exist(temp_file, 'file'), delete(temp_file); end
+tea = TEA('demo.mat', SR, true, 't_units', 's');
+tea.write(t, Samples);
+disp(tea.info());
 
-%% 1. Create a continuous TEA file
-fprintf('=== 1. Create a continuous TEA file ===\n');
+%% 2. Read by time range
+[Data, t_out] = tea.read([1, 3], [1.0, 2.5], []);
+fprintf('Read %d samples, channels [1,3], t=[%.3f, %.3f]\n', size(Data,1), t_out(1), t_out(end));
 
-SR = 1000; % 1000 Hz
-duration = 5; % 5 seconds
-N = SR * duration;
-t = (0:N-1)' / SR; % time in seconds
-ch1 = sin(2*pi*10*t); % 10 Hz sine
-ch2 = cos(2*pi*25*t); % 25 Hz cosine
-Samples = [ch1, ch2];
+%% 3. Read by sample range
+[Data2, t_out2] = tea.read([], [], [100, 500]);
+fprintf('Read samples 100–500: %d samples\n', size(Data2, 1));
 
-brew_TEA(temp_file, t, Samples, SR, true, ...
-    't_units', 's', ...
-    'ch_map', [1, 2]);
+%% 4. Append more time samples
+t2 = t(end) + (1:5000)' / SR;
+s2 = randn(5000, 3);
+tea.write(t2, s2);
+fprintf('After append: N=%d, C=%d\n', tea.N, tea.C);
 
-%% 2. Read it back
-fprintf('\n=== 2. Read it back ===\n');
+%% 5. Append channels
+tea.write_channels(randn(10000, 2), [4, 5]);
+fprintf('After channel append: N=%d, C=%d, ch_map=%s\n', tea.N, tea.C, mat2str(tea.ch_map));
 
-[Data, t_out, disc_info] = drink_TEA(temp_file, [], [], []);
-fprintf('Loaded %d samples, %d channels\n', size(Data, 1), size(Data, 2));
-fprintf('Discontinuous? %d\n', disc_info.is_discontinuous);
+%% 6. Discontinuous data
+t_disc = [(0:999)'/SR; (3000:3999)'/SR];             % 2-second gap
+s_disc = randn(2000, 1);
+tea_disc = TEA('demo_disc.mat', SR, true, 't_units', 's');
+tea_disc.write(t_disc, s_disc);
 
-%% 3. Read a time range
-fprintf('\n=== 3. Read a time range ===\n');
+[~, ~, disc_info] = tea_disc.read([], [], []);
+fprintf('Discontinuous: %d, gaps: %d\n', disc_info.is_discontinuous, size(disc_info.disc, 1));
 
-[Data_seg, t_seg] = drink_TEA(temp_file, [1], [1.0, 2.0], []);
-fprintf('Segment: %d samples of channel 1, t=[%.3f, %.3f]\n', ...
-    length(t_seg), t_seg(1), t_seg(end));
+%% 7. Irregular data
+t_irr = sort(rand(200, 1) * 100);
+tea_irr = TEA('demo_irreg.mat', [], false);
+tea_irr.write(t_irr, randn(200, 2));
+fprintf('Irregular: N=%d\n', tea_irr.N);
 
-%% 4. Read a sample range
-fprintf('\n=== 4. Read a sample range ===\n');
-
-[Data_sr, t_sr] = drink_TEA(temp_file, [2], [], [100, 200]);
-fprintf('Sample range: %d samples of channel 2\n', size(Data_sr, 1));
-
-%% 5. Append in time
-fprintf('\n=== 5. Append more data in time ===\n');
-
-t_new = t(end) + (1:N)' / SR; % next 5 seconds
-ch1_new = sin(2*pi*10*t_new);
-ch2_new = cos(2*pi*25*t_new);
-Samples_new = [ch1_new, ch2_new];
-
-brew_TEA(temp_file, t_new, Samples_new, SR, true, 'mode', 'append_time');
-
-[Data_full, t_full, disc_full] = drink_TEA(temp_file, [], [], []);
-fprintf('After append: %d samples total\n', size(Data_full, 1));
-fprintf('Discontinuous? %d\n', disc_full.is_discontinuous);
-
-%% 6. Create a discontinuous TEA file
-fprintf('\n=== 6. Create a discontinuous file ===\n');
-
-temp_disc = fullfile(tempdir, 'tea_disc_example.mat');
-if exist(temp_disc, 'file'), delete(temp_disc); end
-
-% Two segments separated by a 2-second gap
-t1 = (0:999)' / SR; % 0 to 0.999 s
-t2 = (3000:3999)' / SR; % 3.0 to 3.999 s (gap from 1.0 to 3.0)
-t_disc = [t1; t2];
-s_disc = randn(length(t_disc), 1);
-
-brew_TEA(temp_disc, t_disc, s_disc, SR, true, 't_units', 's');
-
-[~, ~, disc_info2] = drink_TEA(temp_disc, [], [], []);
-fprintf('Discontinuous? %d\n', disc_info2.is_discontinuous);
-fprintf('Continuous blocks:\n');
-disp(disc_info2.cont);
-fprintf('Discontinuities:\n');
-disp(disc_info2.disc);
-
-%% 7. Demonstrate refresh_TEA
-fprintf('\n=== 7. Refresh a file missing dependents ===\n');
-
-temp_refresh = fullfile(tempdir, 'tea_refresh_example.mat');
-if exist(temp_refresh, 'file'), delete(temp_refresh); end
-
-% Manually create a minimal TEA file without dependents
-t_r = (0:4999)' / 500;
-s_r = randn(5000, 2);
-save(temp_refresh, 't_r', '-v7.3');
-mf = matfile(temp_refresh, 'Writable', true);
-% Rename to proper TEA variables
-mf.t = t_r;
-mf.Samples = s_r;
-mf.SR = 500;
-mf.isRegular = true;
-
-fprintf('Before refresh:\n');
-vars_before = whos(mf);
-fprintf('  Variables: %s\n', strjoin({vars_before.name}, ', '));
-
-refresh_TEA(temp_refresh);
-
-mf2 = matfile(temp_refresh);
-vars_after = whos(mf2);
-fprintf('After refresh:\n');
-fprintf('  Variables: %s\n', strjoin({vars_after.name}, ', '));
-
-%% 8. Plot
-fprintf('\n=== 8. Plot example ===\n');
-
-figure('Name', 'TEA Example');
-
-subplot(2,1,1);
-plot(t_full, Data_full);
-xlabel('Time (s)'); ylabel('Amplitude');
-title('Continuous TEA file (after append)');
-legend('ch1: 10 Hz sine', 'ch2: 25 Hz cosine');
-
-subplot(2,1,2);
-[Data_disc_plot, t_disc_plot] = drink_TEA(temp_disc, [], [], []);
-plot(t_disc_plot, Data_disc_plot, '.-');
-xlabel('Time (s)'); ylabel('Amplitude');
-title('Discontinuous TEA file (2s gap)');
-
-%% Cleanup
-delete(temp_file);
-delete(temp_disc);
-delete(temp_refresh);
-fprintf('\nExample complete. Temp files cleaned up.\n');
+%% 8. Cleanup
+delete('demo.mat', 'demo_disc.mat', 'demo_irreg.mat');
+disp('Done!');
