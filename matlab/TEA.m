@@ -229,10 +229,9 @@ classdef TEA < handle
                 obj.h5_resize_and_append(obj.file_path, '/t', [N_total, 1], double(t(:)), N_old);
                 obj.h5_resize_and_append(obj.file_path, '/Samples', [N_total, C_old], Samples, N_old);
 
-                % Recompute dependents
+                % Incrementally update dependents (no full t reload)
                 mf = matfile(obj.file_path, 'Writable', true);
-                t_full = mf.t(:, 1);
-                obj.write_dependents(mf, t_full);
+                obj.update_dependents_incremental(mf, double(t(:)), t_last, N_old, N_total);
 
                 fprintf('TEA file appended: %s (now %d samples)\n', obj.file_path, N_total);
             end
@@ -489,6 +488,91 @@ classdef TEA < handle
                 isCont = true;
             end
             mf.isContinuous = isCont;
+        end
+
+        function update_dependents_incremental(obj, mf, t_new, t_last, N_old, N_total)
+        % UPDATE_DEPENDENTS_INCREMENTAL Update dependent vars without full t reload.
+        %
+        %   Uses only the new chunk (t_new), the last existing timestamp (t_last),
+        %   and existing metadata to incrementally update cont/disc/isContinuous
+        %   and t_coarse. Falls back to write_dependents if metadata is missing.
+
+            vars = {whos(mf).name};
+
+            % --- Fallback: if file lacks dependent metadata, do full recompute ---
+            has_meta = ismember('isContinuous', vars) && ismember('df_t_coarse', vars);
+            if ~has_meta
+                warning('TEA:NoMeta', ...
+                    'Dependent metadata missing. Falling back to full recompute. Run refresh() to fix.');
+                t_full = mf.t(:, 1);
+                obj.write_dependents(mf, t_full);
+                return;
+            end
+
+            N_new = length(t_new);
+
+            % === isContinuous / cont / disc ===
+            if obj.isRegular && ~isempty(obj.SR) && obj.SR > 0
+                gap_threshold = 1.1 / obj.SR;
+
+                % Load existing discontinuity state (small data)
+                old_isCont = mf.isContinuous;
+                if ~old_isCont && ismember('disc', vars)
+                    old_disc = mf.disc;
+                else
+                    old_disc = zeros(0, 2);
+                end
+
+                % Check junction gap
+                new_gap_entries = zeros(0, 2);
+                if (t_new(1) - t_last) > gap_threshold
+                    new_gap_entries = [N_old, N_old + 1];
+                end
+
+                % Check gaps within new chunk
+                if N_new > 1
+                    dt_new = diff(t_new);
+                    gap_mask = dt_new > gap_threshold;
+                    if any(gap_mask)
+                        gi = find(gap_mask);
+                        new_gap_entries = [new_gap_entries; ...
+                            N_old + gi(:), N_old + gi(:) + 1];
+                    end
+                end
+
+                % Merge
+                all_disc = [old_disc; new_gap_entries];
+                if isempty(all_disc)
+                    mf.isContinuous = true;
+                else
+                    mf.isContinuous = false;
+                    mf.disc = all_disc;
+                    mf.cont = [[1; all_disc(:,2)], [all_disc(:,1); N_total]];
+                end
+
+            else
+                % Irregular or no SR: always continuous by convention
+                mf.isContinuous = true;
+            end
+
+            % === t_coarse ===
+            df = mf.df_t_coarse;
+            if ismember('t_coarse', vars)
+                old_t_coarse = mf.t_coarse;
+            else
+                old_t_coarse = [];
+            end
+
+            % Find new grid points: coarse indices are 1, 1+df, 1+2*df, ...
+            last_coarse_global = 1 + floor((N_old - 1) / df) * df;
+            next_coarse_global = last_coarse_global + df;
+            new_coarse_globals = next_coarse_global : df : N_total;
+
+            if ~isempty(new_coarse_globals)
+                new_coarse_locals = new_coarse_globals - N_old;
+                new_t_coarse = t_new(new_coarse_locals);
+                mf.t_coarse = [old_t_coarse(:); new_t_coarse(:)];
+            end
         end
 
         function [Data, t_out] = load_by_time_range(obj, mf, t_range, channel_indices, data_var_name, total_samples, info, is_loading_samples, file_vars)

@@ -13,7 +13,7 @@ classdef test_tea < matlab.unittest.TestCase
             if ~exist(tc.temp_dir, 'dir')
                 mkdir(tc.temp_dir);
             end
-            addpath(fullfile(fileparts(fileparts(mfilename('fullpath'))), 'matlab'));
+            addpath(fileparts(fileparts(mfilename('fullpath'))));
         end
     end
 
@@ -283,6 +283,105 @@ classdef test_tea < matlab.unittest.TestCase
             t2 = t(end) + (1:500)' / SR;
             tea2.write(t2, randn(500, 2));
             tc.verifyEqual(tea2.N, 1500);
+        end
+
+        %% Test 16: Append creates discontinuity at junction
+        function test_append_creates_discontinuity(tc)
+            f = fullfile(tc.temp_dir, 'jdisc.mat');
+            SR = 1000;
+            t1 = (0:999)' / SR;
+            tea = TEA(f, SR, true);
+            tea.write(t1, randn(1000, 2));
+
+            % Append with a 2-second gap
+            t2 = (3000:3999)' / SR;
+            tea.write(t2, randn(1000, 2));
+
+            mf = matfile(f);
+            tc.verifyFalse(mf.isContinuous);
+            tc.verifyEqual(mf.disc, [1000, 1001]);
+            tc.verifyEqual(mf.cont, [1, 1000; 1001, 2000]);
+        end
+
+        %% Test 17: Append to already-discontinuous file
+        function test_append_to_discontinuous_file(tc)
+            f = fullfile(tc.temp_dir, 'adisc.mat');
+            SR = 1000;
+
+            % First write: continuous
+            t1 = (0:999)' / SR;
+            tea = TEA(f, SR, true);
+            tea.write(t1, randn(1000, 1));
+
+            % Second write: gap at junction
+            t2 = (5000:5999)' / SR;
+            tea.write(t2, randn(1000, 1));
+
+            % Third write: another gap
+            t3 = (9000:9999)' / SR;
+            tea.write(t3, randn(1000, 1));
+
+            mf = matfile(f);
+            tc.verifyFalse(mf.isContinuous);
+            tc.verifyEqual(size(mf.disc, 1), 2);
+            tc.verifyEqual(mf.disc, [1000, 1001; 2000, 2001]);
+            tc.verifyEqual(mf.cont, [1, 1000; 1001, 2000; 2001, 3000]);
+        end
+
+        %% Test 18: Append chunk with internal gaps
+        function test_append_with_internal_gaps(tc)
+            f = fullfile(tc.temp_dir, 'igap.mat');
+            SR = 1000;
+            t1 = (0:499)' / SR;
+            tea = TEA(f, SR, true);
+            tea.write(t1, randn(500, 1));
+
+            % Append a chunk that itself has two internal gaps
+            seg_a = (500:699)' / SR;     % continuous with t1
+            seg_b = (3000:3199)' / SR;   % gap
+            seg_c = (6000:6199)' / SR;   % gap
+            t2 = [seg_a; seg_b; seg_c];
+            tea.write(t2, randn(length(t2), 1));
+
+            mf = matfile(f);
+            tc.verifyFalse(mf.isContinuous);
+            tc.verifyEqual(size(mf.disc, 1), 2);
+            % Gaps at local indices 200 and 400 in t2 → global 700 and 900
+            tc.verifyEqual(mf.disc, [700, 701; 900, 901]);
+        end
+
+        %% Test 19: Incremental matches full recompute
+        function test_incremental_matches_full_recompute(tc)
+            f = fullfile(tc.temp_dir, 'incr.mat');
+            SR = 500;
+
+            tea = TEA(f, SR, true);
+
+            % Write, then append several chunks with mixed gaps
+            t1 = (0:999)' / SR;
+            tea.write(t1, randn(1000, 2));
+
+            t2 = t1(end) + (1:500)' / SR;  % continuous
+            tea.write(t2, randn(500, 2));
+
+            t3 = (5000:5499)' / SR;  % gap
+            tea.write(t3, randn(500, 2));
+
+            % Snapshot incremental results
+            mf = matfile(f);
+            inc_cont = mf.cont;
+            inc_disc = mf.disc;
+            inc_isCont = mf.isContinuous;
+            inc_tc = mf.t_coarse;
+
+            % Full recompute
+            tea.refresh();
+
+            mf2 = matfile(f);
+            tc.verifyEqual(inc_isCont, mf2.isContinuous);
+            tc.verifyEqual(inc_disc, mf2.disc);
+            tc.verifyEqual(inc_cont, mf2.cont);
+            tc.verifyEqual(inc_tc, mf2.t_coarse, 'AbsTol', 1e-12);
         end
 
     end
