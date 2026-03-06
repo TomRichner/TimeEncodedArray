@@ -193,7 +193,7 @@ class TEA:
             else:
                 new_map = np.concatenate([old_map, np.arange(C_old + 1, C_total + 1, dtype=np.float64)])
 
-            self._write_h5_array(f, 'ch_map', new_map.reshape(1, -1))
+            self._write_h5_array(f, 'ch_map', new_map.reshape(1, -1))  # MATLAB [1, C]
 
         print(f"TEA channels appended: {self._file_path} (now {C_total} channels)")
 
@@ -403,7 +403,8 @@ class TEA:
 
         # t_coarse
         t_coarse = t[::df] if N > 0 else np.array([])
-        tc_data = t_coarse.reshape(1, -1) if len(t_coarse) > 0 else np.zeros((1, 0))
+        # t_coarse: MATLAB [M, 1] column vector
+        tc_data = t_coarse.reshape(-1, 1) if len(t_coarse) > 0 else np.zeros((0, 1))
         self._write_h5_array(f, 't_coarse', tc_data)
         self._write_h5_scalar(f, 'df_t_coarse', float(df))
 
@@ -422,9 +423,9 @@ class TEA:
                 starts = np.concatenate([[1], gap_idx + 2])
                 ends = np.concatenate([gap_idx + 1, [N]])
                 cont = np.column_stack([starts, ends])
-                # Store transposed for MATLAB: [n, 2] → HDF5 (2, n)
-                self._write_h5_array(f, 'disc', disc.T.astype(np.float64))
-                self._write_h5_array(f, 'cont', cont.T.astype(np.float64))
+                # Pass in MATLAB shape [n, 2]; helper handles HDF5 transposition
+                self._write_h5_array(f, 'disc', disc.astype(np.float64))
+                self._write_h5_array(f, 'cont', cont.astype(np.float64))
 
         if is_cont:
             # Remove disc/cont if they exist (was continuous)
@@ -450,7 +451,7 @@ class TEA:
 
             old_is_cont = bool(np.squeeze(f['isContinuous'][()]))
             if not old_is_cont and 'disc' in f:
-                old_disc = f['disc'][()].T  # HDF5 (2,n) → (n,2)
+                old_disc = f['disc'][()].T  # HDF5 transposed → MATLAB shape (n,2)
             else:
                 old_disc = np.zeros((0, 2))
 
@@ -482,18 +483,19 @@ class TEA:
                         del f[var]
             else:
                 self._write_h5_scalar(f, 'isContinuous', False, logical=True)
-                self._write_h5_array(f, 'disc', all_disc.T)
+                self._write_h5_array(f, 'disc', all_disc)  # MATLAB [n, 2]
                 starts = np.concatenate([[1], all_disc[:, 1]])
                 ends = np.concatenate([all_disc[:, 0], [N_total]])
                 cont = np.column_stack([starts, ends])
-                self._write_h5_array(f, 'cont', cont.T)
+                self._write_h5_array(f, 'cont', cont)  # MATLAB [n, 2]
         else:
             self._write_h5_scalar(f, 'isContinuous', True, logical=True)
 
         # === t_coarse ===
         df = int(np.squeeze(f['df_t_coarse'][()]))
         if 't_coarse' in f:
-            old_tc = f['t_coarse'][0, :]
+            # t_coarse stored as HDF5 transposed; read and flatten
+            old_tc = f['t_coarse'][()].ravel()
         else:
             old_tc = np.array([])
 
@@ -507,7 +509,7 @@ class TEA:
             new_coarse_locals = new_coarse_locals[valid]
             new_tc = t_new[new_coarse_locals]
             combined_tc = np.concatenate([old_tc, new_tc])
-            self._write_h5_array(f, 't_coarse', combined_tc.reshape(1, -1))
+            self._write_h5_array(f, 't_coarse', combined_tc.reshape(-1, 1))  # MATLAB [M, 1]
 
     # ============ Private: Read Helpers ============
 
@@ -550,7 +552,7 @@ class TEA:
             return s_start, s_end
 
         # Use t_coarse for fast lookup
-        tc = f['t_coarse'][0, :]
+        tc = f['t_coarse'][()].ravel()
         df = int(np.squeeze(f['df_t_coarse'][()]))
 
         # Find start
@@ -626,10 +628,16 @@ class TEA:
 
     @staticmethod
     def _write_h5_array(f, name, data):
-        """Write a numeric array as a MATLAB-compatible HDF5 dataset."""
+        """Write a numeric array as a MATLAB-compatible HDF5 dataset.
+
+        Data is transposed for HDF5 storage so MATLAB reads correct dimensions.
+        Caller provides data in MATLAB-logical shape (e.g. (1, N) for row vector);
+        stored as HDF5 (N, 1) so MATLAB sees [1, N].
+        """
         if name in f:
             del f[name]
-        ds = f.create_dataset(name, data=np.asarray(data, dtype=np.float64))
+        arr = np.asarray(data, dtype=np.float64)
+        ds = f.create_dataset(name, data=arr.T)
         ds.attrs['MATLAB_class'] = np.bytes_('double')
 
     @staticmethod
