@@ -8,11 +8,21 @@ Uses h5py for all HDF5 operations. The MATLAB v7.3 userblock header
 is written directly as raw bytes.
 """
 
-import numpy as np
-import h5py
+from __future__ import annotations
+
+import logging
 import os
 import time
 import warnings
+
+import h5py
+import numpy as np
+import numpy.typing as npt
+
+logger = logging.getLogger(__name__)
+
+# Type aliases
+ArrayFloat64 = npt.NDArray[np.float64]
 
 
 class TEA:
@@ -29,9 +39,10 @@ class TEA:
         data, t_out, disc = tea.read(channels=[1, 3], t_range=(1.0, 2.5))
     """
 
-    def __init__(self, file_path, SR, is_regular, *,
-                 t_units='', t_offset=None, t_offset_units='',
-                 t_offset_scale=1.0, hdr=None, tea_version='1.0'):
+    def __init__(self, file_path: str, SR: float | None, is_regular: bool, *,
+                 t_units: str = '', t_offset: int | float | None = None,
+                 t_offset_units: str = '', t_offset_scale: float = 1.0,
+                 hdr: dict | None = None, tea_version: str = '1.0') -> None:
         """
         Create or bind to a TEA file.
 
@@ -89,22 +100,22 @@ class TEA:
     # ============ Properties ============
 
     @property
-    def file_path(self):
+    def file_path(self) -> str:
         """Bound file path (immutable)."""
         return self._file_path
 
     @property
-    def SR(self):
-        """Sample rate in samples per t_units (immutable)."""        
+    def SR(self) -> float | None:
+        """Sample rate in samples per t_units (immutable)."""
         return self._SR
 
     @property
-    def is_regular(self):
+    def is_regular(self) -> bool:
         """Regularity flag (immutable)."""
         return self._is_regular
 
     @property
-    def N(self):
+    def N(self) -> int:
         """Total sample count (read from file)."""
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
@@ -113,7 +124,7 @@ class TEA:
             return f['t'].shape[1]
 
     @property
-    def C(self):
+    def C(self) -> int:
         """Channel count (read from file)."""
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
@@ -122,10 +133,10 @@ class TEA:
             return f['Samples'].shape[0]
 
     @property
-    def ch_map(self):
+    def ch_map(self) -> ArrayFloat64:
         """Channel identity vector (read from file)."""
         if not os.path.isfile(self._file_path) or not self._is_initialized:
-            return np.array([])
+            return np.array([], dtype=np.float64)
         with h5py.File(self._file_path, 'r') as f:
             if 'ch_map' in f:
                 return np.squeeze(f['ch_map'][()]).ravel().astype(np.float64)
@@ -134,7 +145,7 @@ class TEA:
 
     # ============ Write ============
 
-    def write(self, t, samples):
+    def write(self, t: npt.ArrayLike, samples: npt.ArrayLike) -> None:
         """
         Append time-series data to the TEA file.
 
@@ -181,13 +192,14 @@ class TEA:
         if not self._is_initialized:
             self._create_file(t, samples)
             self._is_initialized = True
-            print(f"TEA file created: {self._file_path} ({N_new} samples, {C_new} channels)")
+            logger.info("TEA file created: %s (%d samples, %d channels)",
+                        self._file_path, N_new, C_new)
         else:
             self._append_time(t, samples)
 
     # ============ Write Absolute ============
 
-    def write_absolute(self, t_abs, samples):
+    def write_absolute(self, t_abs: npt.ArrayLike, samples: npt.ArrayLike) -> None:
         """
         Write using absolute timestamps — subtracts t_offset * t_offset_scale.
 
@@ -204,7 +216,8 @@ class TEA:
 
     # ============ Write Channels ============
 
-    def write_channels(self, samples, ch_map=None):
+    def write_channels(self, samples: npt.ArrayLike,
+                       ch_map: list[int] | npt.ArrayLike | None = None) -> None:
         """
         Append new channels (columns) to existing data.
 
@@ -244,11 +257,15 @@ class TEA:
 
             self._write_h5_array(f, 'ch_map', new_map.reshape(1, -1))  # MATLAB [1, C]
 
-        print(f"TEA channels appended: {self._file_path} (now {C_total} channels)")
+        logger.info("TEA channels appended: %s (now %d channels)",
+                    self._file_path, C_total)
 
     # ============ Read ============
 
-    def read(self, channels=None, t_range=None, s_range=None):
+    def read(self, channels: list[int] | None = None,
+             t_range: tuple[float, float] | None = None,
+             s_range: tuple[int, int] | None = None,
+             ) -> tuple[ArrayFloat64, ArrayFloat64, dict]:
         """
         Read data from the TEA file.
 
@@ -303,7 +320,7 @@ class TEA:
 
     # ============ Refresh ============
 
-    def refresh(self):
+    def refresh(self) -> None:
         """Recompute all dependent variables from the full t vector."""
         if not os.path.isfile(self._file_path):
             raise FileNotFoundError(f"File not found: {self._file_path}")
@@ -314,11 +331,11 @@ class TEA:
             if 'tea_version' not in f:
                 self._write_h5_string(f, 'tea_version', '1.0')
 
-        print(f"TEA refreshed: {self._file_path}")
+        logger.info("TEA refreshed: %s", self._file_path)
 
     # ============ Info ============
 
-    def info(self):
+    def info(self) -> dict:
         """Return a summary dict of the TEA file."""
         result = {
             'file_path': self._file_path,
@@ -346,7 +363,7 @@ class TEA:
 
     # ============ Private: Validation ============
 
-    def _validate_t(self, t):
+    def _validate_t(self, t: ArrayFloat64) -> None:
         if len(t) == 0:
             raise ValueError("t must not be empty")
         if not np.issubdtype(t.dtype, np.number):
@@ -354,7 +371,7 @@ class TEA:
         if len(t) > 1 and np.any(np.diff(t) <= 0):
             raise ValueError("t must be strictly monotonically increasing")
 
-    def _validate_regularity(self, t):
+    def _validate_regularity(self, t: ArrayFloat64) -> None:
         if len(t) < 2:
             return
         dt = np.diff(t)
@@ -376,7 +393,7 @@ class TEA:
 
     # ============ Private: File Creation ============
 
-    def _create_file(self, t, samples):
+    def _create_file(self, t: ArrayFloat64, samples: ArrayFloat64) -> None:
         N, C = len(t), samples.shape[1]
         chunk_n = min(32000, max(1, N))
 
@@ -416,7 +433,7 @@ class TEA:
         self._write_matlab_header(self._file_path)
 
     @staticmethod
-    def _write_matlab_header(file_path):
+    def _write_matlab_header(file_path: str) -> None:
         """Write the 128-byte MATLAB v7.3 MAT-file header into the userblock."""
         desc = (f"MATLAB 7.3 MAT-file, Platform: Python, "
                 f"Created on: {time.strftime('%c')} "
@@ -434,7 +451,7 @@ class TEA:
 
     # ============ Private: Append ============
 
-    def _append_time(self, t, samples):
+    def _append_time(self, t: ArrayFloat64, samples: ArrayFloat64) -> None:
         N_new, C_new = len(t), samples.shape[1]
 
         with h5py.File(self._file_path, 'r+') as f:
@@ -463,11 +480,12 @@ class TEA:
             # Update dependents incrementally
             self._update_dependents_incremental(f, t, t_last, N_old, N_total)
 
-        print(f"TEA file appended: {self._file_path} (now {N_total} samples)")
+        logger.info("TEA file appended: %s (now %d samples)",
+                    self._file_path, N_total)
 
     # ============ Private: Dependents ============
 
-    def _write_dependents(self, f, t):
+    def _write_dependents(self, f: h5py.File, t: ArrayFloat64) -> None:
         N = len(t)
 
         # df_t_coarse
@@ -513,7 +531,9 @@ class TEA:
 
         self._write_h5_scalar(f, 'isContinuous', is_cont, logical=True)
 
-    def _update_dependents_incremental(self, f, t_new, t_last, N_old, N_total):
+    def _update_dependents_incremental(self, f: h5py.File, t_new: ArrayFloat64,
+                                       t_last: float, N_old: int,
+                                       N_total: int) -> None:
         N_new = len(t_new)
 
         # Check if we have prior metadata
@@ -591,7 +611,8 @@ class TEA:
 
     # ============ Private: Read Helpers ============
 
-    def _resolve_channels(self, f, channels, total_C):
+    def _resolve_channels(self, f: h5py.File, channels: list[int] | None,
+                          total_C: int) -> np.ndarray | None:
         if channels is None:
             return None
         if 'ch_map' in f:
@@ -607,7 +628,9 @@ class TEA:
             indices.append(found[0])
         return np.array(indices)
 
-    def _find_range_from_time(self, f, t_range, total_N):
+    def _find_range_from_time(self, f: h5py.File,
+                              t_range: tuple[float, float],
+                              total_N: int) -> tuple[int, int]:
         if total_N == 0:
             return 0, -1
 
@@ -659,7 +682,7 @@ class TEA:
         s_end = max(0, min(s_end, total_N - 1))
         return int(s_start), int(s_end)
 
-    def _compute_disc_info(self, t_out):
+    def _compute_disc_info(self, t_out: ArrayFloat64) -> dict:
         NN = len(t_out)
         result = {'is_discontinuous': False,
                   'cont': np.zeros((0, 2)),
@@ -692,7 +715,8 @@ class TEA:
     # ============ Private: HDF5 Helpers ============
 
     @staticmethod
-    def _write_h5_scalar(f, name, value, logical=False):
+    def _write_h5_scalar(f: h5py.File, name: str,
+                         value: int | float, logical: bool = False) -> None:
         """Write a scalar value as a MATLAB-compatible HDF5 dataset (shape [1,1])."""
         if name in f:
             del f[name]
@@ -705,7 +729,7 @@ class TEA:
             ds.attrs['MATLAB_class'] = np.bytes_('double')
 
     @staticmethod
-    def _write_h5_array(f, name, data):
+    def _write_h5_array(f: h5py.File, name: str, data: npt.ArrayLike) -> None:
         """Write a numeric array as a MATLAB-compatible HDF5 dataset.
 
         Data is transposed for HDF5 storage so MATLAB reads correct dimensions.
@@ -719,7 +743,7 @@ class TEA:
         ds.attrs['MATLAB_class'] = np.bytes_('double')
 
     @staticmethod
-    def _write_h5_string(f, name, value):
+    def _write_h5_string(f: h5py.File, name: str, value: str) -> None:
         """Write a string as a MATLAB-compatible HDF5 dataset (row vector)."""
         if name in f:
             del f[name]
