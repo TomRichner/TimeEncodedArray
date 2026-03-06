@@ -92,14 +92,15 @@ def compare_files(py_file, ml_file):
             val_py = np.atleast_1d(val_py)
             val_ml = np.atleast_1d(val_ml)
 
-            if val_py.shape != val_ml.shape:
-                print(f"  {var:<20s} FAIL (shape: {val_py.shape} vs {val_ml.shape})")
-                n_fail += 1
-                continue
-
+            # Both empty = pass (handle shape variations like (0,0) vs (0,))
             if val_py.size == 0 and val_ml.size == 0:
                 print(f"  {var:<20s} PASS (empty)")
                 n_pass += 1
+                continue
+
+            if val_py.shape != val_ml.shape:
+                print(f"  {var:<20s} FAIL (shape: {val_py.shape} vs {val_ml.shape})")
+                n_fail += 1
                 continue
 
             max_diff = np.max(np.abs(val_py.ravel() - val_ml.ravel()))

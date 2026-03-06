@@ -4,14 +4,14 @@ tea.py - Python implementation of the TEA (Time-Encoded Array) class.
 Produces MATLAB v7.3 (.mat) compatible HDF5 files that can be opened
 by the MATLAB TEA class or any HDF5 reader.
 
-Uses hdf5storage for initial file creation (MATLAB header) and h5py
-for chunked/resizable dataset operations.
+Uses h5py for all HDF5 operations. The MATLAB v7.3 userblock header
+is written directly as raw bytes.
 """
 
 import numpy as np
 import h5py
-import hdf5storage
 import os
+import time
 
 
 class TEA:
@@ -326,19 +326,20 @@ class TEA:
 
     def _create_file(self, t, samples):
         N, C = len(t), samples.shape[1]
-
-        # Create file with MATLAB-compatible header via hdf5storage
-        # Only scalar/logical metadata here; strings written via h5py for consistency
-        meta = {}
-        meta['SR'] = np.float64(self._SR) if self._SR is not None else np.zeros((0, 0))
-        meta['isRegular'] = np.bool_(self._is_regular)
-
-        hdf5storage.savemat(self._file_path, meta, format='7.3', oned_as='column')
-
-        # Add chunked datasets and string metadata via h5py
         chunk_n = min(32000, max(1, N))
 
-        with h5py.File(self._file_path, 'r+') as f:
+        # Create HDF5 file with 512-byte userblock for MATLAB v7.3 compatibility
+        with h5py.File(self._file_path, 'w', userblock_size=512) as f:
+            # SR: scalar for regular, empty [] for irregular
+            if self._SR is not None:
+                self._write_h5_scalar(f, 'SR', np.float64(self._SR))
+            else:
+                # MATLAB stores [] as uint64([0,0]) with MATLAB_empty=1
+                ds_sr = f.create_dataset('SR', data=np.array([0, 0], dtype=np.uint64))
+                ds_sr.attrs['MATLAB_class'] = np.bytes_('double')
+                ds_sr.attrs['MATLAB_empty'] = np.uint8(1)
+            # isRegular
+            self._write_h5_scalar(f, 'isRegular', self._is_regular, logical=True)
             # t: MATLAB [N,1] → HDF5 (1, N)
             ds_t = f.create_dataset('t', data=t.reshape(1, -1),
                              maxshape=(1, None), chunks=(1, chunk_n))
@@ -347,12 +348,32 @@ class TEA:
             ds_s = f.create_dataset('Samples', data=samples.T,
                              maxshape=(None, None), chunks=(max(1, C), chunk_n))
             ds_s.attrs['MATLAB_class'] = np.bytes_('double')
-            # Write string metadata via h5py (consistent row-vector format)
+            # String metadata
             self._write_h5_string(f, 'tea_version', self.tea_version)
             if self.t_units:
                 self._write_h5_string(f, 't_units', self.t_units)
-            # Write dependents
+            # Dependent variables
             self._write_dependents(f, t)
+
+        # Write the 128-byte MATLAB v7.3 header into the userblock
+        self._write_matlab_header(self._file_path)
+
+    @staticmethod
+    def _write_matlab_header(file_path):
+        """Write the 128-byte MATLAB v7.3 MAT-file header into the userblock."""
+        desc = (f"MATLAB 7.3 MAT-file, Platform: Python, "
+                f"Created on: {time.strftime('%c')} "
+                f"HDF5 schema 1.00 .")
+        # Bytes 1-116: description (space-padded, ASCII)
+        desc_bytes = desc.encode('ascii')[:116].ljust(116, b' ')
+        # Bytes 117-124: subsys data offset (8 zero bytes)
+        # Bytes 125-126: version [0x00, 0x02]
+        # Bytes 127-128: endian indicator 'IM' (little-endian)
+        trailer = b'\x00' * 8 + b'\x00\x02' + b'IM'
+        header = desc_bytes + trailer  # 128 bytes total
+
+        with open(file_path, 'r+b') as fid:
+            fid.write(header)
 
     # ============ Private: Append ============
 

@@ -9,7 +9,7 @@ Implementations in **Python** and **MATLAB** produce identical files — verifie
 ### Dependencies
 
 ```
-numpy, h5py, hdf5storage
+numpy, h5py
 ```
 
 ### Quick Start
