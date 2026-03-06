@@ -18,7 +18,7 @@ These must exist for a file to be a valid TEA file.
 |----------|------|-------|-------------|
 | `t` | numeric | `[N × 1]` | Timestamp per sample. Must be monotonically increasing. Units defined by `t_units`; unitless if `t_units` is absent |
 | `Samples` | any numeric | `[N × C]` | Data matrix — N time samples, C channels |
-| `SR` | double | scalar or `[]` | Effective sample rate in Hz. **Can be empty when `isRegular = false`** (irregular sampling has no fixed rate) |
+| `SR` | double | scalar or `[]` | Effective sample rate in samples per `t_units`. When `t_units = 's'`, this equals Hz. When `t_units = 'us'`, this is samples/μs (e.g., 0.03 for 30 kHz). **Can be empty when `isRegular = false`** |
 | `isRegular` | logical | scalar | `true` if samples are regularly spaced (constant `dt` between consecutive samples within continuous segments) |
 
 ### 2. Dependent Variables
@@ -38,6 +38,9 @@ Derivable from required variables. They accelerate read performance and provide 
 | Variable | Type | Shape | Description |
 |----------|------|-------|-------------|
 | `t_units` | char | string | Units of `t` (e.g., `'us'`, `'s'`, `'ms'`). If absent, `t` is unitless |
+| `t_offset` | int64 or double | scalar | Reference time anchor. Absolute time = `t_offset × t_offset_scale + t`. Units specified by `t_offset_units` |
+| `t_offset_units` | char | string | Units of `t_offset` (e.g., `'posix_s'`, `'posix_us'`). Required when `t_offset` is present |
+| `t_offset_scale` | double | scalar | Conversion factor from `t_offset` units to `t` units. Defaults to `1.0` when `t_offset_units == t_units`. Required when they differ |
 | `ch_map` | double | `[1 × C]` | Channel identity vector mapping columns of `Samples` to source channel numbers. Defaults to `1:C` if absent |
 | `SR_original` | double | scalar | Original sample rate before decimation (equals `SR` if undecimated) |
 | `hdr` | struct | free-form | Source-specific metadata |
@@ -77,6 +80,40 @@ When `isRegular = false`, discontinuity analysis does not apply. Irregular times
 | `true` | `true` | Uniform sampling, no gaps | Not stored |
 | `true` | `false` | Uniform within segments, gaps present | Stored |
 | `false` | `true` (convention) | Irregular sampling | Not applicable |
+
+---
+
+## Time Offset Model
+
+`t_offset` provides an optional absolute time anchor for the recording. When present, the absolute time of each sample is:
+
+```
+t_absolute = t_offset × t_offset_scale + t
+```
+
+Where:
+- `t_offset` is a scalar (commonly int64 POSIX seconds)
+- `t_offset_scale` converts `t_offset` into `t` units (default `1.0` when units match)
+- `t` contains relative timestamps in `t_units`
+
+**Example:** `t_offset = 1770000000` (POSIX seconds), `t` in microseconds, `t_offset_scale = 1e6`:
+```
+t_absolute_us = 1770000000 × 1e6 + t
+```
+
+When `t_offset` is absent, `t` is interpreted as-is (absolute or relative at the user's discretion).
+
+---
+
+## Float64 Precision
+
+`t` is stored as float64. At large magnitudes, float64 quantization noise may degrade timestamp accuracy. The granularity at a value x is:
+
+```
+ULP(x) ≈ x × 2⁻⁵²
+```
+
+Writers SHOULD warn when `ULP(t[0]) / median(diff(t)) > 0.01` (1%), indicating that float64 precision is insufficient for the sample spacing at the current `t` magnitude. Using `t_offset` to reduce `t` magnitude eliminates this issue.
 
 ---
 

@@ -29,14 +29,17 @@ classdef TEA < handle
 
     properties (SetAccess = immutable)
         file_path   char        % Path to the HDF5/.mat file
-        SR          double      % Sample rate (Hz), [] for irregular
+        SR          double      % Sample rate (samples/t_units), [] for irregular
         isRegular   logical     % true = regularly spaced samples
     end
 
     properties
-        t_units     char = ''   % Units of t ('s','us','ms', etc.)
-        hdr         struct      % Free-form metadata header
-        tea_version char = '1.0'
+        t_units         char = ''       % Units of t ('s','us','ms', etc.)
+        t_offset                        % Reference time anchor (int64 or double scalar)
+        t_offset_units  char = ''       % Units of t_offset ('posix_s', 'posix_us', etc.)
+        t_offset_scale  double = 1.0    % Conversion: t_offset_units → t_units
+        hdr             struct          % Free-form metadata header
+        tea_version     char = '1.0'
     end
 
     properties (SetAccess = private)
@@ -59,6 +62,9 @@ classdef TEA < handle
             addRequired(p, 'SR');
             addRequired(p, 'isRegular', @(x) islogical(x) && isscalar(x));
             addParameter(p, 't_units', '', @ischar);
+            addParameter(p, 't_offset', [], @(x) isempty(x) || isscalar(x));
+            addParameter(p, 't_offset_units', '', @ischar);
+            addParameter(p, 't_offset_scale', 1.0, @(x) isscalar(x) && x > 0);
             addParameter(p, 'hdr', struct(), @isstruct);
             addParameter(p, 'tea_version', '1.0', @ischar);
             parse(p, file_path, SR, isRegular, varargin{:});
@@ -78,8 +84,18 @@ classdef TEA < handle
             obj.SR = SR;
             obj.isRegular = isRegular;
             obj.t_units = p.Results.t_units;
+            obj.t_offset = p.Results.t_offset;
+            obj.t_offset_units = p.Results.t_offset_units;
+            obj.t_offset_scale = p.Results.t_offset_scale;
             obj.hdr = p.Results.hdr;
             obj.tea_version = p.Results.tea_version;
+
+            % Warn if t_units != 's' on new file
+            if ~exist(file_path, 'file') && ~isempty(obj.t_units) && ~strcmp(obj.t_units, 's')
+                warning('TEA:SRUnits', ...
+                    't_units=''%s''. SR is interpreted as samples/%s, not Hz.', ...
+                    obj.t_units, obj.t_units);
+            end
 
             % If file exists, validate and sync
             if exist(file_path, 'file') == 2
@@ -176,6 +192,23 @@ classdef TEA < handle
                 obj.validate_regularity(t);
             end
 
+            % --- Sanity checks ---
+            % Large-t-with-offset: warn if t looks absolute
+            if ~isempty(obj.t_offset) && abs(t(1)) > 1e8
+                warning('TEA:AbsoluteTimestamp', ...
+                    't(1)=%.3e looks like an absolute timestamp. Use write_absolute() or subtract t_offset.', t(1));
+            end
+            % Float64 precision check
+            if N_new > 1
+                ulp_val = eps(abs(t(1)));
+                median_dt = median(diff(t));
+                if median_dt > 0 && (ulp_val / median_dt) > 0.01
+                    warning('TEA:PrecisionLoss', ...
+                        'float64 precision at t(1)=%.3e is %.3e ULP, which is %.1f%% of sample spacing. Consider using t_offset.', ...
+                        t(1), ulp_val, (ulp_val / median_dt) * 100);
+                end
+            end
+
             if ~obj.is_initialized
                 % --- First write: create file ---
                 obj.init(N_new, C_new, class(Samples));
@@ -195,6 +228,11 @@ classdef TEA < handle
                 % Write optionals
                 if ~isempty(obj.t_units)
                     mf.t_units = obj.t_units;
+                end
+                if ~isempty(obj.t_offset)
+                    mf.t_offset = obj.t_offset;
+                    mf.t_offset_units = obj.t_offset_units;
+                    mf.t_offset_scale = obj.t_offset_scale;
                 end
                 if ~isempty(fieldnames(obj.hdr))
                     mf.hdr = obj.hdr;
@@ -235,6 +273,22 @@ classdef TEA < handle
 
                 fprintf('TEA file appended: %s (now %d samples)\n', obj.file_path, N_total);
             end
+        end
+
+        %% ============ WRITE_ABSOLUTE ============
+        function write_absolute(obj, t_abs, Samples)
+        % WRITE_ABSOLUTE Write using absolute timestamps.
+        %
+        %   tea.write_absolute(t_abs, Samples)
+        %
+        %   Subtracts t_offset * t_offset_scale from t_abs, then calls write().
+        %   Requires t_offset to be set in the constructor.
+
+            if isempty(obj.t_offset)
+                error('TEA:NoOffset', 'Cannot use write_absolute() without t_offset. Set t_offset in constructor.');
+            end
+            t_rel = double(t_abs) - double(obj.t_offset) * obj.t_offset_scale;
+            obj.write(t_rel, Samples);
         end
 
         %% ============ WRITE_CHANNELS ============
@@ -395,6 +449,9 @@ classdef TEA < handle
             s.C = obj.C;
             s.ch_map = obj.ch_map;
             s.t_units = obj.t_units;
+            s.t_offset = obj.t_offset;
+            s.t_offset_units = obj.t_offset_units;
+            s.t_offset_scale = obj.t_offset_scale;
 
             if exist(obj.file_path, 'file') == 2
                 mf = matfile(obj.file_path);

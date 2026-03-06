@@ -101,7 +101,7 @@ See [schema/tea_schema.md](schema/tea_schema.md) for the full specification.
 |----------|-------|-------------|
 | `t` | `[N×1]` | Timestamps (monotonically increasing) |
 | `Samples` | `[N×C]` | Data matrix (any numeric type) |
-| `SR` | scalar/`[]` | Sample rate in Hz (empty if irregular) |
+| `SR` | scalar/`[]` | Sample rate in samples per `t_units` (= Hz when `t_units='s'`) |
 | `isRegular` | scalar | Regular sampling flag |
 
 ### Dependent (auto-computed)
@@ -110,7 +110,7 @@ See [schema/tea_schema.md](schema/tea_schema.md) for the full specification.
 
 ### Optional
 
-`t_units`, `ch_map`, `SR_original`, `hdr`, `tea_version`
+`t_units`, `t_offset`, `t_offset_units`, `t_offset_scale`, `ch_map`, `SR_original`, `hdr`, `tea_version`
 
 ## API
 

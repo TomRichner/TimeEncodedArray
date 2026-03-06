@@ -463,5 +463,93 @@ classdef test_tea < matlab.unittest.TestCase
             tc.verifyError(@() tea.write(t, randn(4, 1)), 'TEA:MonotonicityViolation');
         end
 
+        %% Test 25: t_offset basic storage
+        function test_t_offset_basic(tc)
+            f = fullfile(tc.temp_dir, 'toff.mat');
+            SR = 1000;
+            t = (0:999)' / SR;
+
+            tea = TEA(f, SR, true, 't_offset', int64(1770000000), ...
+                't_offset_units', 'posix_s', 't_offset_scale', 1.0);
+            tea.write(t, randn(1000, 1));
+
+            % Check stored in file
+            mf = matfile(f);
+            tc.verifyEqual(mf.t_offset, int64(1770000000));
+            tc.verifyEqual(mf.t_offset_units, 'posix_s');
+            tc.verifyEqual(mf.t_offset_scale, 1.0);
+
+            % Check info returns it
+            s = tea.info();
+            tc.verifyEqual(s.t_offset, int64(1770000000));
+            tc.verifyEqual(s.t_offset_units, 'posix_s');
+        end
+
+        %% Test 26: write_absolute basic
+        function test_write_absolute(tc)
+            f = fullfile(tc.temp_dir, 'wabs.mat');
+            SR = 1000;
+            t_offset = int64(1000);
+
+            tea = TEA(f, SR, true, 't_offset', t_offset, ...
+                't_offset_units', 's', 't_offset_scale', 1.0);
+
+            % Absolute timestamps: 1000.0, 1000.001, ..., 1000.999
+            t_abs = 1000.0 + (0:999)' / SR;
+            tea.write_absolute(t_abs, randn(1000, 1));
+
+            % Should be stored as relative: 0, 0.001, ..., 0.999
+            mf = matfile(f);
+            t_stored = mf.t(:, 1);
+            tc.verifyEqual(t_stored(1), 0, 'AbsTol', 1e-10);
+            tc.verifyEqual(t_stored(end), 0.999, 'AbsTol', 1e-10);
+        end
+
+        %% Test 27: write_absolute cross-unit (t_offset in s, t in us)
+        function test_write_absolute_cross_unit(tc)
+            f = fullfile(tc.temp_dir, 'wabx.mat');
+            SR = 0.03;  % samples per microsecond (30 kHz)
+            t_offset = int64(1000);  % seconds
+
+            % scale = 1e6: t_offset is in seconds, t is in microseconds
+            tea = TEA(f, SR, true, 't_units', 'us', ...
+                't_offset', t_offset, 't_offset_units', 'posix_s', ...
+                't_offset_scale', 1e6);
+
+            % Absolute timestamps in microseconds
+            t_abs_us = 1e9 + (0:99)' * (1/SR);  % 1e9 us = 1000 s
+            tea.write_absolute(t_abs_us, randn(100, 1));
+
+            % Stored t should be relative: t_abs - 1000 * 1e6 = 0, 33.33, ...
+            mf = matfile(f);
+            t_stored = mf.t(:, 1);
+            tc.verifyEqual(t_stored(1), 0, 'AbsTol', 1);
+        end
+
+        %% Test 28: write_absolute without t_offset errors
+        function test_write_absolute_no_offset(tc)
+            f = fullfile(tc.temp_dir, 'wano.mat');
+            tea = TEA(f, 1000, true);
+            tc.verifyError(@() tea.write_absolute((0:9)', randn(10, 1)), 'TEA:NoOffset');
+        end
+
+        %% Test 29: SR units warning with t_units != 's'
+        function test_sr_units_warning(tc)
+            f = fullfile(tc.temp_dir, 'sruw.mat');
+            tc.verifyWarning(@() TEA(f, 0.03, true, 't_units', 'us'), 'TEA:SRUnits');
+        end
+
+        %% Test 30: precision warning with large timestamps
+        function test_precision_warning(tc)
+            f = fullfile(tc.temp_dir, 'prec.mat');
+            % 1 MHz in microseconds with absolute POSIX microsecond timestamps
+            % t ~ 1.77e15, dt = 1 us, ULP ~ 0.25 → ratio ~ 25%
+            SR = 1;  % 1 sample per microsecond
+            tea = TEA(f, SR, true, 't_units', 'us');
+
+            t_abs = 1.77e15 + (0:99)';  % absolute posix microseconds
+            tc.verifyWarning(@() tea.write(t_abs, randn(100, 1)), 'TEA:PrecisionLoss');
+        end
+
     end
 end
