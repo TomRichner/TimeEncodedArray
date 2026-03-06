@@ -67,6 +67,16 @@ class TestDiscontinuous:
         assert di['is_discontinuous']
         assert di['disc'].shape[0] == 1  # one gap
 
+        # Verify stored disc/cont values match MATLAB convention (1-indexed)
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            stored_disc = hf['disc'][()].T  # HDF5 transposed → (n, 2)
+            stored_cont = hf['cont'][()].T
+            stored_is_cont = bool(np.squeeze(hf['isContinuous'][()]))
+        assert not stored_is_cont
+        np.testing.assert_array_equal(stored_disc, [[1000, 1001]])
+        np.testing.assert_array_equal(stored_cont, [[1, 1000], [1001, 2000]])
+
 
 # ============ Test 3: Sample range read ============
 
@@ -437,3 +447,122 @@ class TestIncrementalMatchesRefresh:
         np.testing.assert_array_equal(inc_disc, ref_disc)
         np.testing.assert_array_equal(inc_cont, ref_cont)
         np.testing.assert_allclose(inc_tc, ref_tc, atol=1e-12)
+
+
+# ============ Test 17: Channel default (no ch_map) ============
+
+class TestChannelDefault:
+    def test_no_ch_map(self, temp_dir):
+        """Select channels by default 1-indexed position (no explicit ch_map)."""
+        f = mat_path(temp_dir, 'chd')
+        SR = 100
+        N = 500
+        t = np.arange(N) / SR
+        samples = np.column_stack([np.ones(N), 2 * np.ones(N)])
+
+        tea = TEA(f, SR, True)
+        tea.write(t, samples)
+
+        Data, _, _ = tea.read(channels=[2])
+        np.testing.assert_allclose(Data[0, 0], 2, atol=1e-12)
+
+
+# ============ Test 18: Regularity validation error ============
+
+class TestRegularityValidation:
+    def test_error(self, temp_dir):
+        """Highly irregular data with is_regular=True should raise."""
+        f = mat_path(temp_dir, 'ie')
+        SR = 1000
+        t = np.cumsum([0, 0.001, 0.01, 0.1, 0.001, 0.5, 0.001, 0.3, 0.001, 0.2])
+        samples = np.random.randn(len(t), 1)
+
+        tea = TEA(f, SR, True)
+        with pytest.raises(ValueError):
+            tea.write(t, samples)
+
+
+# ============ Test 19: Graceful fallback (no t_coarse) ============
+
+class TestNoTcoarseFallback:
+    def test_time_range_without_tcoarse(self, temp_dir):
+        """Time-range read should work even if t_coarse is missing."""
+        f = mat_path(temp_dir, 'nc')
+        SR = 1000
+        N = 5000
+        t = np.arange(N, dtype=np.float64) / SR
+        samples = np.arange(1, N + 1, dtype=np.float64).reshape(-1, 1)
+
+        tea = TEA(f, SR, True)
+        tea.write(t, samples)
+
+        # Remove t_coarse and df_t_coarse
+        import h5py
+        with h5py.File(f, 'r+') as hf:
+            if 't_coarse' in hf:
+                del hf['t_coarse']
+            if 'df_t_coarse' in hf:
+                del hf['df_t_coarse']
+
+        # Time-range read should still work via full-t fallback
+        Data, t_out, _ = tea.read(t_range=(1.0, 2.0))
+        assert t_out[0] >= 1.0
+        assert t_out[-1] <= 2.0
+        np.testing.assert_allclose(Data[0, 0], 1001, atol=1e-12)
+
+
+# ============ Test 20: Append to already-discontinuous file ============
+
+class TestAppendToDiscontinuous:
+    def test_multi_gap_accumulation(self, temp_dir):
+        """Three writes with gaps → 2 disc entries, 3 cont segments."""
+        f = mat_path(temp_dir, 'adisc')
+        SR = 1000
+        tea = TEA(f, SR, True)
+
+        t1 = np.arange(1000, dtype=np.float64) / SR
+        tea.write(t1, np.random.randn(1000, 1))
+
+        t2 = np.arange(5000, 6000, dtype=np.float64) / SR  # gap
+        tea.write(t2, np.random.randn(1000, 1))
+
+        t3 = np.arange(9000, 10000, dtype=np.float64) / SR  # gap
+        tea.write(t3, np.random.randn(1000, 1))
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            stored_disc = hf['disc'][()].T
+            stored_cont = hf['cont'][()].T
+            stored_is_cont = bool(np.squeeze(hf['isContinuous'][()]))
+        assert not stored_is_cont
+        assert stored_disc.shape[0] == 2
+        np.testing.assert_array_equal(stored_disc, [[1000, 1001], [2000, 2001]])
+        np.testing.assert_array_equal(stored_cont, [[1, 1000], [1001, 2000], [2001, 3000]])
+
+
+# ============ Test 21: Append chunk with internal gaps ============
+
+class TestAppendInternalGaps:
+    def test_gaps_within_chunk(self, temp_dir):
+        """Append a single chunk that itself contains two internal gaps."""
+        f = mat_path(temp_dir, 'igap')
+        SR = 1000
+        tea = TEA(f, SR, True)
+
+        t1 = np.arange(500, dtype=np.float64) / SR
+        tea.write(t1, np.random.randn(500, 1))
+
+        # Append chunk with internal gaps
+        seg_a = np.arange(500, 700, dtype=np.float64) / SR     # continuous with t1
+        seg_b = np.arange(3000, 3200, dtype=np.float64) / SR   # gap
+        seg_c = np.arange(6000, 6200, dtype=np.float64) / SR   # gap
+        t2 = np.concatenate([seg_a, seg_b, seg_c])
+        tea.write(t2, np.random.randn(len(t2), 1))
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            stored_disc = hf['disc'][()].T
+            stored_is_cont = bool(np.squeeze(hf['isContinuous'][()]))
+        assert not stored_is_cont
+        assert stored_disc.shape[0] == 2
+        np.testing.assert_array_equal(stored_disc, [[700, 701], [900, 901]])

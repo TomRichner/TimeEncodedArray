@@ -384,5 +384,84 @@ classdef test_tea < matlab.unittest.TestCase
             tc.verifyEqual(inc_tc, mf2.t_coarse, 'AbsTol', 1e-12);
         end
 
+        %% Test 20: Time range at discontinuity boundary
+        function test_time_range_at_discontinuity(tc)
+            f = fullfile(tc.temp_dir, 'trd.mat');
+            SR = 1000;
+            t1 = (0:999)' / SR;        % 0.0 to 0.999
+            t2 = 5.0 + (0:999)' / SR;  % 5.0 to 5.999
+            t = [t1; t2];
+            s = (1:2000)';
+
+            tea = TEA(f, SR, true);
+            tea.write(t, s);
+
+            % Query only first segment
+            [Data1, t_out1, di1] = tea.read([], [0.0, 0.999], []);
+            tc.verifyEqual(length(t_out1), 1000);
+            tc.verifyFalse(di1.is_discontinuous);
+
+            % Query only second segment
+            [Data2, t_out2, di2] = tea.read([], [5.0, 5.999], []);
+            tc.verifyEqual(length(t_out2), 1000);
+            tc.verifyFalse(di2.is_discontinuous);
+        end
+
+        %% Test 21: Time range spanning gap
+        function test_time_range_spanning_gap(tc)
+            f = fullfile(tc.temp_dir, 'trg.mat');
+            SR = 1000;
+            t1 = (0:999)' / SR;
+            t2 = 5.0 + (0:999)' / SR;
+            t = [t1; t2];
+            s = (1:2000)';
+
+            tea = TEA(f, SR, true);
+            tea.write(t, s);
+
+            % Query across the gap
+            [~, t_out, di] = tea.read([], [0.5, 5.5], []);
+            tc.verifyGreaterThanOrEqual(t_out(1), 0.5);
+            tc.verifyLessThanOrEqual(t_out(end), 5.5);
+            tc.verifyTrue(di.is_discontinuous);
+        end
+
+        %% Test 22: Time range exact boundaries
+        function test_time_range_exact_boundaries(tc)
+            f = fullfile(tc.temp_dir, 'tre.mat');
+            SR = 1000; N = 5000;
+            t = (0:N-1)' / SR;
+            s = (1:N)';
+
+            tea = TEA(f, SR, true);
+            tea.write(t, s);
+
+            [Data, t_out] = tea.read([], [0.0, t(end)], []);
+            tc.verifyEqual(length(t_out), N);
+            tc.verifyEqual(Data(1), 1, 'AbsTol', 1e-12);
+            tc.verifyEqual(Data(end), N, 'AbsTol', 1e-12);
+        end
+
+        %% Test 23: SR mismatch error
+        function test_sr_mismatch(tc)
+            f = fullfile(tc.temp_dir, 'srm.mat');
+            SR = 1000;
+            t = (0:99)' / SR;
+
+            tea = TEA(f, SR, true);
+            tea.write(t, randn(100, 1));
+
+            tc.verifyError(@() TEA(f, 500, true), 'TEA:SRMismatch');
+        end
+
+        %% Test 24: Non-monotonic t error
+        function test_non_monotonic(tc)
+            f = fullfile(tc.temp_dir, 'mono.mat');
+            t = [0; 1; 0.5; 2];
+
+            tea = TEA(f, 1000, true);
+            tc.verifyError(@() tea.write(t, randn(4, 1)), 'TEA:MonotonicityViolation');
+        end
+
     end
 end
