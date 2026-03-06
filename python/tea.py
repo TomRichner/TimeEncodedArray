@@ -328,16 +328,14 @@ class TEA:
         N, C = len(t), samples.shape[1]
 
         # Create file with MATLAB-compatible header via hdf5storage
+        # Only scalar/logical metadata here; strings written via h5py for consistency
         meta = {}
         meta['SR'] = np.float64(self._SR) if self._SR is not None else np.zeros((0, 0))
         meta['isRegular'] = np.bool_(self._is_regular)
-        meta['tea_version'] = self.tea_version
-        if self.t_units:
-            meta['t_units'] = self.t_units
 
         hdf5storage.savemat(self._file_path, meta, format='7.3', oned_as='column')
 
-        # Add chunked datasets via h5py
+        # Add chunked datasets and string metadata via h5py
         chunk_n = min(32000, max(1, N))
 
         with h5py.File(self._file_path, 'r+') as f:
@@ -349,6 +347,10 @@ class TEA:
             ds_s = f.create_dataset('Samples', data=samples.T,
                              maxshape=(None, None), chunks=(max(1, C), chunk_n))
             ds_s.attrs['MATLAB_class'] = np.bytes_('double')
+            # Write string metadata via h5py (consistent row-vector format)
+            self._write_h5_string(f, 'tea_version', self.tea_version)
+            if self.t_units:
+                self._write_h5_string(f, 't_units', self.t_units)
             # Write dependents
             self._write_dependents(f, t)
 
@@ -635,8 +637,8 @@ class TEA:
         """Write a string as a MATLAB-compatible HDF5 dataset (row vector)."""
         if name in f:
             del f[name]
-        # Store as uint16 row vector (1, len) for MATLAB char compatibility
-        encoded = np.array([[ord(c) for c in value]], dtype=np.uint16)  # shape (1, len)
+        # Store as uint16 column in HDF5 (len, 1) → MATLAB sees [1, len] row vector
+        encoded = np.array([ord(c) for c in value], dtype=np.uint16).reshape(-1, 1)  # shape (len, 1)
         ds = f.create_dataset(name, data=encoded)
         ds.attrs['MATLAB_class'] = np.bytes_('char')
         ds.attrs['MATLAB_int_decode'] = np.int32(2)
