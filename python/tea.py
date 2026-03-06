@@ -12,6 +12,7 @@ import numpy as np
 import h5py
 import os
 import time
+import warnings
 
 
 class TEA:
@@ -29,15 +30,19 @@ class TEA:
     """
 
     def __init__(self, file_path, SR, is_regular, *,
-                 t_units='', hdr=None, tea_version='1.0'):
+                 t_units='', t_offset=None, t_offset_units='',
+                 t_offset_scale=1.0, hdr=None, tea_version='1.0'):
         """
         Create or bind to a TEA file.
 
         Args:
             file_path: Path to the .mat file
-            SR: Sample rate in Hz (None for irregular data)
+            SR: Sample rate in samples per t_units (None for irregular data)
             is_regular: True if samples are regularly spaced
             t_units: Units of t ('s', 'us', 'ms', etc.)
+            t_offset: Reference time anchor (int or float scalar)
+            t_offset_units: Units of t_offset ('posix_s', 'posix_us', etc.)
+            t_offset_scale: Conversion factor from t_offset units to t units
             hdr: Free-form metadata dict
             tea_version: Format version string
         """
@@ -45,6 +50,9 @@ class TEA:
         self._SR = float(SR) if SR is not None else None
         self._is_regular = bool(is_regular)
         self.t_units = str(t_units)
+        self._t_offset = t_offset
+        self._t_offset_units = str(t_offset_units)
+        self._t_offset_scale = float(t_offset_scale)
         self.hdr = hdr if hdr is not None else {}
         self.tea_version = str(tea_version)
         self._is_initialized = False
@@ -56,6 +64,12 @@ class TEA:
         else:
             if SR is not None and SR <= 0:
                 raise ValueError("SR must be positive or None")
+
+        # Warn if t_units != 's' on new file
+        if not os.path.isfile(self._file_path) and t_units and t_units != 's':
+            warnings.warn(
+                f"t_units='{t_units}'. SR is interpreted as samples/{t_units}, not Hz.",
+                stacklevel=2)
 
         # If file exists, validate and sync
         if os.path.isfile(self._file_path):
@@ -81,7 +95,7 @@ class TEA:
 
     @property
     def SR(self):
-        """Sample rate in Hz (immutable)."""
+        """Sample rate in samples per t_units (immutable)."""        
         return self._SR
 
     @property
@@ -146,12 +160,47 @@ class TEA:
         if self._is_regular:
             self._validate_regularity(t)
 
+        # --- Sanity checks ---
+        # Large-t-with-offset: warn if t looks absolute
+        if self._t_offset is not None and abs(t[0]) > 1e8:
+            warnings.warn(
+                f"t[0]={t[0]:.3e} looks like an absolute timestamp. "
+                f"Use write_absolute() or subtract t_offset.",
+                stacklevel=2)
+        # Float64 precision check
+        if N_new > 1:
+            ulp_val = np.spacing(abs(t[0]))
+            median_dt = np.median(np.diff(t))
+            if median_dt > 0 and (ulp_val / median_dt) > 0.01:
+                warnings.warn(
+                    f"float64 precision at t[0]={t[0]:.3e} is {ulp_val:.3e} ULP, "
+                    f"which is {ulp_val / median_dt * 100:.1f}% of sample spacing. "
+                    f"Consider using t_offset.",
+                    stacklevel=2)
+
         if not self._is_initialized:
             self._create_file(t, samples)
             self._is_initialized = True
             print(f"TEA file created: {self._file_path} ({N_new} samples, {C_new} channels)")
         else:
             self._append_time(t, samples)
+
+    # ============ Write Absolute ============
+
+    def write_absolute(self, t_abs, samples):
+        """
+        Write using absolute timestamps — subtracts t_offset * t_offset_scale.
+
+        Args:
+            t_abs: 1D array of absolute timestamps
+            samples: 2D array of shape (N, C)
+        """
+        if self._t_offset is None:
+            raise ValueError(
+                "Cannot use write_absolute() without t_offset. "
+                "Set t_offset in constructor.")
+        t_rel = np.float64(t_abs) - np.float64(self._t_offset) * self._t_offset_scale
+        self.write(t_rel, samples)
 
     # ============ Write Channels ============
 
@@ -279,6 +328,9 @@ class TEA:
             'C': self.C,
             'ch_map': self.ch_map,
             't_units': self.t_units,
+            't_offset': self._t_offset,
+            't_offset_units': self._t_offset_units,
+            't_offset_scale': self._t_offset_scale,
         }
 
         if os.path.isfile(self._file_path):
@@ -352,6 +404,11 @@ class TEA:
             self._write_h5_string(f, 'tea_version', self.tea_version)
             if self.t_units:
                 self._write_h5_string(f, 't_units', self.t_units)
+            # t_offset metadata
+            if self._t_offset is not None:
+                self._write_h5_scalar(f, 't_offset', self._t_offset)
+                self._write_h5_string(f, 't_offset_units', self._t_offset_units)
+                self._write_h5_scalar(f, 't_offset_scale', float(self._t_offset_scale))
             # Dependent variables
             self._write_dependents(f, t)
 

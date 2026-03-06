@@ -147,14 +147,28 @@ def case8(cv_dir):
     tea.write(t3, s3)
     return f
 
+def case9(cv_dir):
+    """Write 1000x1 with t_offset, SR=1000."""
+    f = os.path.join(cv_dir, 'py_case9.mat')
+    clean(f)
+    SR = 1000
+    t = np.arange(1000, dtype=np.float64) / SR
+    s = np.arange(1, 1001, dtype=np.float64).reshape(-1, 1)
+    tea = TEA(f, SR, True, t_units='s',
+              t_offset=np.int64(1770000000),
+              t_offset_units='posix_s',
+              t_offset_scale=1.0)
+    tea.write(t, s)
+    return f
+
 
 def main():
     cv_dir = get_cv_dir()
-    cases = [case1, case2, case3, case4, case5, case6, case7, case8]
+    cases = [case1, case2, case3, case4, case5, case6, case7, case8, case9]
     for i, fn in enumerate(cases, 1):
         f = fn(cv_dir)
         print(f"  Case {i}: {os.path.basename(f)}")
-    print(f"\nAll 8 Python test cases written to: {cv_dir}")
+    print(f"\nAll 9 Python test cases written to: {cv_dir}")
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 %% compare_test_cases.m — Compare Python vs MATLAB TEA files from MATLAB's perspective.
 %
-% For each case K=1..8, reads py_caseK.mat and ml_caseK.mat via matfile()
+% For each case K=1..9, reads py_caseK.mat and ml_caseK.mat via matfile()
 % and compares every variable for identical values.
 %
 % Tolerance: doubles < 1e-12, char/logical exact.
@@ -20,7 +20,7 @@ function compare_test_cases()
     total_pass = 0;
     total_fail = 0;
 
-    for k = 1:8
+    for k = 1:9
         py_file = fullfile(cv_dir, sprintf('py_case%d.mat', k));
         ml_file = fullfile(cv_dir, sprintf('ml_case%d.mat', k));
 

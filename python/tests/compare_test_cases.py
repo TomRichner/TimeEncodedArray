@@ -1,7 +1,7 @@
 """
 compare_test_cases.py — Compare Python vs MATLAB TEA files from Python's perspective.
 
-For each case K=1..8, reads py_caseK.mat and ml_caseK.mat via h5py
+For each case K=1..9, reads py_caseK.mat and ml_caseK.mat via h5py
 and compares every variable for identical values.
 
 Tolerance: doubles < 1e-12, char/logical/int exact.
@@ -123,7 +123,7 @@ def main():
     total_pass = 0
     total_fail = 0
 
-    for k in range(1, 9):
+    for k in range(1, 10):
         py_file = os.path.join(cv_dir, f'py_case{k}.mat')
         ml_file = os.path.join(cv_dir, f'ml_case{k}.mat')
 

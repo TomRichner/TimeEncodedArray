@@ -10,6 +10,7 @@ import tempfile
 import shutil
 import os
 import sys
+import warnings
 
 # Add parent dir to path so we can import tea
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -566,3 +567,111 @@ class TestAppendInternalGaps:
         assert not stored_is_cont
         assert stored_disc.shape[0] == 2
         np.testing.assert_array_equal(stored_disc, [[700, 701], [900, 901]])
+
+
+# ============ Test 26: t_offset basic storage ============
+
+class TestTOffsetBasic:
+    def test_basic(self, temp_dir):
+        f = os.path.join(temp_dir, 'toff.mat')
+        SR = 1000
+        t = np.arange(1000) / SR
+
+        tea = TEA(f, SR, True, t_offset=np.int64(1770000000),
+                  t_offset_units='posix_s', t_offset_scale=1.0)
+        tea.write(t, np.random.randn(1000, 1))
+
+        # Check stored in file
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            stored_offset = np.squeeze(hf['t_offset'][()])
+            assert stored_offset == 1770000000
+
+        # Check info returns it
+        info = tea.info()
+        assert info['t_offset'] == np.int64(1770000000)
+        assert info['t_offset_units'] == 'posix_s'
+        assert info['t_offset_scale'] == 1.0
+
+
+# ============ Test 27: write_absolute basic ============
+
+class TestWriteAbsolute:
+    def test_basic(self, temp_dir):
+        f = os.path.join(temp_dir, 'wabs.mat')
+        SR = 1000
+        t_offset = np.int64(1000)
+
+        tea = TEA(f, SR, True, t_offset=t_offset,
+                  t_offset_units='s', t_offset_scale=1.0)
+
+        # Absolute timestamps
+        t_abs = 1000.0 + np.arange(1000) / SR
+        tea.write_absolute(t_abs, np.random.randn(1000, 1))
+
+        # Should be stored as relative
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            t_stored = hf['t'][0, :]
+        np.testing.assert_allclose(t_stored[0], 0.0, atol=1e-10)
+        np.testing.assert_allclose(t_stored[-1], 0.999, atol=1e-10)
+
+
+# ============ Test 28: write_absolute cross-unit ============
+
+class TestWriteAbsoluteCrossUnit:
+    def test_cross_unit(self, temp_dir):
+        f = os.path.join(temp_dir, 'wabx.mat')
+        SR = 0.03  # samples/us (30 kHz)
+        t_offset = np.int64(1000)  # seconds
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tea = TEA(f, SR, True, t_units='us',
+                      t_offset=t_offset, t_offset_units='posix_s',
+                      t_offset_scale=1e6)
+
+        # Absolute timestamps in microseconds (1e9 us = 1000 s)
+        t_abs_us = 1e9 + np.arange(100) * (1 / SR)
+        tea.write_absolute(t_abs_us, np.random.randn(100, 1))
+
+        # Stored t should be relative
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            t_stored = hf['t'][0, :]
+        np.testing.assert_allclose(t_stored[0], 0.0, atol=1.0)
+
+
+# ============ Test 29: write_absolute without t_offset errors ============
+
+class TestWriteAbsoluteNoOffset:
+    def test_no_offset(self, temp_dir):
+        f = os.path.join(temp_dir, 'wano.mat')
+        tea = TEA(f, 1000, True)
+        with pytest.raises(ValueError, match="t_offset"):
+            tea.write_absolute(np.arange(10, dtype=float), np.random.randn(10, 1))
+
+
+# ============ Test 30: SR units warning ============
+
+class TestSRUnitsWarning:
+    def test_warning(self, temp_dir):
+        f = os.path.join(temp_dir, 'sruw.mat')
+        with pytest.warns(UserWarning, match="samples/us"):
+            TEA(f, 0.03, True, t_units='us')
+
+
+# ============ Test 31: precision warning ============
+
+class TestPrecisionWarning:
+    def test_warning(self, temp_dir):
+        f = os.path.join(temp_dir, 'prec.mat')
+        SR = 1  # 1 sample/us
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tea = TEA(f, SR, True, t_units='us')
+
+        t_abs = 1.77e15 + np.arange(100, dtype=float)
+        with pytest.warns(UserWarning, match="precision"):
+            tea.write(t_abs, np.random.randn(100, 1))
+
