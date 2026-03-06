@@ -104,6 +104,85 @@ class TestTimeRange:
         assert t_out[-1] <= 2.0
         assert len(t_out) > 0
 
+    def test_at_discontinuity(self, temp_dir):
+        """Query a time range that lands exactly at a discontinuity boundary."""
+        f = mat_path(temp_dir, 'tr_disc')
+        SR = 1000
+        t1 = np.arange(1000) / SR      # 0.0 to 0.999
+        t2 = 5.0 + np.arange(1000) / SR  # 5.0 to 5.999
+        t = np.concatenate([t1, t2])
+        s = np.arange(1, 2001, dtype=np.float64).reshape(-1, 1)
+
+        tea = TEA(f, SR, True)
+        tea.write(t, s)
+
+        # Query only the first segment
+        Data, t_out, di = tea.read(t_range=(0.0, 0.999))
+        assert t_out[-1] <= 0.999 + 1e-10
+        assert len(t_out) == 1000
+        assert not di['is_discontinuous']
+
+        # Query only the second segment
+        Data2, t_out2, di2 = tea.read(t_range=(5.0, 5.999))
+        assert t_out2[0] >= 5.0 - 1e-10
+        assert len(t_out2) == 1000
+        assert not di2['is_discontinuous']
+
+    def test_spanning_gap(self, temp_dir):
+        """Query a range that spans a discontinuity gap."""
+        f = mat_path(temp_dir, 'tr_span')
+        SR = 1000
+        t1 = np.arange(1000) / SR
+        t2 = 5.0 + np.arange(1000) / SR
+        t = np.concatenate([t1, t2])
+        s = np.arange(1, 2001, dtype=np.float64).reshape(-1, 1)
+
+        tea = TEA(f, SR, True)
+        tea.write(t, s)
+
+        # Query from 0.5 to 5.5 — spans the gap
+        Data, t_out, di = tea.read(t_range=(0.5, 5.5))
+        assert t_out[0] >= 0.5
+        assert t_out[-1] <= 5.5
+        assert di['is_discontinuous']
+
+    def test_beyond_file_range(self, temp_dir):
+        """Query a time range entirely outside the file's data."""
+        f = mat_path(temp_dir, 'tr_beyond')
+        SR = 1000
+        N = 1000
+        t = np.arange(N) / SR  # 0 to 0.999
+        s = np.ones((N, 1))
+
+        tea = TEA(f, SR, True)
+        tea.write(t, s)
+
+        # Query beyond file end
+        Data, t_out, _ = tea.read(t_range=(10.0, 20.0))
+        assert len(t_out) == 0
+        assert Data.shape[0] == 0
+
+        # Query before file start
+        Data2, t_out2, _ = tea.read(t_range=(-5.0, -1.0))
+        assert len(t_out2) == 0
+
+    def test_exact_boundaries(self, temp_dir):
+        """Query exactly at the first and last sample times."""
+        f = mat_path(temp_dir, 'tr_exact')
+        SR = 1000
+        N = 5000
+        t = np.arange(N) / SR
+        s = np.arange(1, N + 1, dtype=np.float64).reshape(-1, 1)
+
+        tea = TEA(f, SR, True)
+        tea.write(t, s)
+
+        # Read entire range by exact bounds
+        Data, t_out, _ = tea.read(t_range=(0.0, t[-1]))
+        assert len(t_out) == N
+        np.testing.assert_allclose(Data[0, 0], 1, atol=1e-12)
+        np.testing.assert_allclose(Data[-1, 0], N, atol=1e-12)
+
 
 # ============ Test 5: Channel selection ============
 
@@ -343,7 +422,7 @@ class TestIncrementalMatchesRefresh:
             inc_isCont = bool(np.squeeze(hf['isContinuous'][()]))
             inc_disc = hf['disc'][()].T if 'disc' in hf else np.zeros((0, 2))
             inc_cont = hf['cont'][()].T if 'cont' in hf else np.zeros((0, 2))
-            inc_tc = hf['t_coarse'][0, :]
+            inc_tc = hf['t_coarse'][()].ravel()
 
         # Full recompute
         tea.refresh()
@@ -352,7 +431,7 @@ class TestIncrementalMatchesRefresh:
             ref_isCont = bool(np.squeeze(hf['isContinuous'][()]))
             ref_disc = hf['disc'][()].T if 'disc' in hf else np.zeros((0, 2))
             ref_cont = hf['cont'][()].T if 'cont' in hf else np.zeros((0, 2))
-            ref_tc = hf['t_coarse'][0, :]
+            ref_tc = hf['t_coarse'][()].ravel()
 
         assert inc_isCont == ref_isCont
         np.testing.assert_array_equal(inc_disc, ref_disc)

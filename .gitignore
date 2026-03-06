@@ -10,6 +10,15 @@
 *.nsd
 *.med
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Test output
+cross_validation_data/
+
 # OS
 Thumbs.db
 .DS_Store
