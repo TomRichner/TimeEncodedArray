@@ -342,11 +342,13 @@ class TEA:
 
         with h5py.File(self._file_path, 'r+') as f:
             # t: MATLAB [N,1] → HDF5 (1, N)
-            f.create_dataset('t', data=t.reshape(1, -1),
+            ds_t = f.create_dataset('t', data=t.reshape(1, -1),
                              maxshape=(1, None), chunks=(1, chunk_n))
+            ds_t.attrs['MATLAB_class'] = np.bytes_('double')
             # Samples: MATLAB [N,C] → HDF5 (C, N)
-            f.create_dataset('Samples', data=samples.T,
+            ds_s = f.create_dataset('Samples', data=samples.T,
                              maxshape=(None, None), chunks=(max(1, C), chunk_n))
+            ds_s.attrs['MATLAB_class'] = np.bytes_('double')
             # Write dependents
             self._write_dependents(f, t)
 
@@ -609,14 +611,15 @@ class TEA:
 
     @staticmethod
     def _write_h5_scalar(f, name, value, logical=False):
-        """Write a scalar value as a MATLAB-compatible HDF5 dataset."""
+        """Write a scalar value as a MATLAB-compatible HDF5 dataset (shape [1,1])."""
         if name in f:
             del f[name]
         if logical:
-            ds = f.create_dataset(name, data=np.uint8(1 if value else 0))
+            ds = f.create_dataset(name, data=np.array([[np.uint8(1 if value else 0)]], dtype=np.uint8))
             ds.attrs['MATLAB_class'] = np.bytes_('logical')
+            ds.attrs['MATLAB_int_decode'] = np.int32(1)
         else:
-            ds = f.create_dataset(name, data=np.float64(value))
+            ds = f.create_dataset(name, data=np.array([[np.float64(value)]]))
             ds.attrs['MATLAB_class'] = np.bytes_('double')
 
     @staticmethod
@@ -629,10 +632,11 @@ class TEA:
 
     @staticmethod
     def _write_h5_string(f, name, value):
-        """Write a string as a MATLAB-compatible HDF5 dataset."""
+        """Write a string as a MATLAB-compatible HDF5 dataset (row vector)."""
         if name in f:
             del f[name]
-        # Store as uint16 array for MATLAB char compatibility
-        encoded = np.array([ord(c) for c in value], dtype=np.uint16)
+        # Store as uint16 row vector (1, len) for MATLAB char compatibility
+        encoded = np.array([[ord(c) for c in value]], dtype=np.uint16)  # shape (1, len)
         ds = f.create_dataset(name, data=encoded)
         ds.attrs['MATLAB_class'] = np.bytes_('char')
+        ds.attrs['MATLAB_int_decode'] = np.int32(2)
