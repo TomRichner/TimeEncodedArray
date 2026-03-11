@@ -31,6 +31,7 @@ classdef TEA < handle
         file_path   char        % Path to the HDF5/.mat file
         SR          double      % Sample rate (samples/t_units), [] for irregular
         isRegular   logical     % true = regularly spaced samples
+        compress    logical     % true = DEFLATE level 1 + shuffle on t and Samples
     end
 
     properties
@@ -44,6 +45,12 @@ classdef TEA < handle
 
     properties (SetAccess = private)
         is_initialized logical = false  % true after file has datasets
+        expected_length  double = []    % pre-allocation target for N
+        expected_channels double = []   % pre-allocation target for C
+        N_written  double = []  % logical sample count (for pre-allocation tracking)
+        C_written  double = []  % logical channel count
+        N_allocated double = []  % physical allocation (N dimension)
+        C_allocated double = []  % physical allocation (C dimension)
     end
 
     properties (Dependent)
@@ -67,6 +74,9 @@ classdef TEA < handle
             addParameter(p, 't_offset_scale', 1.0, @(x) isscalar(x) && x > 0);
             addParameter(p, 'hdr', struct(), @isstruct);
             addParameter(p, 'tea_version', '1.0', @ischar);
+            addParameter(p, 'compress', false, @(x) islogical(x) && isscalar(x));
+            addParameter(p, 'expected_length', [], @(x) isempty(x) || (isscalar(x) && x > 0));
+            addParameter(p, 'expected_channels', [], @(x) isempty(x) || (isscalar(x) && x > 0));
             parse(p, file_path, SR, isRegular, varargin{:});
 
             % Validate SR
@@ -89,6 +99,9 @@ classdef TEA < handle
             obj.t_offset_scale = p.Results.t_offset_scale;
             obj.hdr = p.Results.hdr;
             obj.tea_version = p.Results.tea_version;
+            obj.compress = p.Results.compress;
+            obj.expected_length = p.Results.expected_length;
+            obj.expected_channels = p.Results.expected_channels;
 
             % Warn if t_units != 's' on new file
             if ~exist(file_path, 'file') && ~isempty(obj.t_units) && ~strcmp(obj.t_units, 's')
@@ -122,6 +135,10 @@ classdef TEA < handle
 
         %% ============ DEPENDENT PROPERTY GETTERS ============
         function val = get.N(obj)
+            if ~isempty(obj.N_written)
+                val = obj.N_written;
+                return;
+            end
             if ~exist(obj.file_path, 'file') || ~obj.is_initialized
                 val = 0;
                 return;
@@ -132,6 +149,10 @@ classdef TEA < handle
         end
 
         function val = get.C(obj)
+            if ~isempty(obj.C_written)
+                val = obj.C_written;
+                return;
+            end
             if ~exist(obj.file_path, 'file') || ~obj.is_initialized
                 val = 0;
                 return;
@@ -162,13 +183,27 @@ classdef TEA < handle
         %   tea.init(n_samples, n_channels, data_class)
         %
         %   Called automatically on first write if not called explicitly.
+        %   When expected_length/expected_channels are set, uses those for
+        %   the initial physical allocation.
 
             if nargin < 4, data_class = 'double'; end
 
-            TEA.h5_init_dataset(obj.file_path, 't', [n_samples, 1], 'double');
-            TEA.h5_init_dataset(obj.file_path, 'Samples', [n_samples, n_channels], data_class);
+            % Determine allocation sizes
+            exp_len = obj.expected_length;
+            exp_ch = obj.expected_channels;
+            if isempty(exp_len), exp_len = n_samples; end
+            if isempty(exp_ch), exp_ch = n_channels; end
+            N_alloc = max(n_samples, exp_len);
+            C_alloc = max(n_channels, exp_ch);
+
+            TEA.h5_init_dataset(obj.file_path, 't', [N_alloc, 1], 'double', obj.compress);
+            TEA.h5_init_dataset(obj.file_path, 'Samples', [N_alloc, C_alloc], data_class, obj.compress);
 
             obj.is_initialized = true;
+            obj.N_written = n_samples;
+            obj.C_written = n_channels;
+            obj.N_allocated = N_alloc;
+            obj.C_allocated = C_alloc;
         end
 
         %% ============ WRITE ============
@@ -213,9 +248,9 @@ classdef TEA < handle
                 % --- First write: create file ---
                 obj.init(N_new, C_new, class(Samples));
 
-                % Write data via h5write (preserves chunked storage)
-                h5write(obj.file_path, '/t', double(t(:)));
-                h5write(obj.file_path, '/Samples', Samples);
+                % Write data via h5write with start/count (handles pre-allocated datasets)
+                h5write(obj.file_path, '/t', double(t(:)), [1, 1], [N_new, 1]);
+                h5write(obj.file_path, '/Samples', Samples, [1, 1], [N_new, C_new]);
 
                 % Write metadata via matfile
                 mf = matfile(obj.file_path, 'Writable', true);
@@ -243,18 +278,16 @@ classdef TEA < handle
 
             else
                 % --- Subsequent write: append in time ---
-                mf = matfile(obj.file_path, 'Writable', true);
-                info_t = whos(mf, 't');
-                N_old = info_t.size(1);
-                info_s = whos(mf, 'Samples');
-                C_old = info_s.size(2);
+                N_old = obj.N;  % uses logical N (from N_written if set)
+                C_old = obj.C;
 
                 if C_new ~= C_old
                     error('TEA:ChannelMismatch', ...
                         'Channel count mismatch: file has %d but write has %d. Use write_channels to add columns.', C_old, C_new);
                 end
 
-                % Validate monotonicity across junction
+                % Validate monotonicity
+                mf = matfile(obj.file_path);
                 t_last = mf.t(N_old, 1);
                 if t(1) <= t_last
                     error('TEA:MonotonicityViolation', ...
@@ -262,12 +295,26 @@ classdef TEA < handle
                 end
 
                 N_total = N_old + N_new;
+                N_phys = obj.N_allocated;
+                if isempty(N_phys)
+                    info_t = whos(mf, 't');
+                    N_phys = info_t.size(1);
+                end
 
-                % Resize and append via HDF5
-                obj.h5_resize_and_append(obj.file_path, '/t', [N_total, 1], double(t(:)), N_old);
-                obj.h5_resize_and_append(obj.file_path, '/Samples', [N_total, C_old], Samples, N_old);
+                if N_total > N_phys
+                    % Need to resize
+                    obj.h5_resize_and_append(obj.file_path, '/t', [N_total, 1], double(t(:)), N_old);
+                    obj.h5_resize_and_append(obj.file_path, '/Samples', [N_total, C_old], Samples, N_old);
+                    obj.N_allocated = N_total;
+                else
+                    % Write within pre-allocated space (no resize)
+                    TEA.h5_write_hyperslab(obj.file_path, '/t', double(t(:)), [N_old, 0]);
+                    TEA.h5_write_hyperslab(obj.file_path, '/Samples', Samples, [N_old, 0]);
+                end
 
-                % Incrementally update dependents (no full t reload)
+                obj.N_written = N_total;
+
+                % Incrementally update dependents
                 mf = matfile(obj.file_path, 'Writable', true);
                 obj.update_dependents_incremental(mf, double(t(:)), t_last, N_old, N_total);
 
@@ -303,21 +350,39 @@ classdef TEA < handle
 
             if nargin < 3, new_ch_map = []; end
 
-            mf = matfile(obj.file_path, 'Writable', true);
-            info_s = whos(mf, 'Samples');
-            N_old = info_s.size(1);
-            C_old = info_s.size(2);
+            N_cur = obj.N;
+            C_old = obj.C;
             N_new = size(Samples, 1);
             C_new = size(Samples, 2);
 
-            if N_new ~= N_old
-                error('TEA:SizeMismatch', 'New channels must have %d rows, but has %d.', N_old, N_new);
+            if N_new ~= N_cur
+                error('TEA:SizeMismatch', 'New channels must have %d rows, but has %d.', N_cur, N_new);
             end
 
             C_total = C_old + C_new;
+            C_phys = obj.C_allocated;
+            if isempty(C_phys)
+                mf = matfile(obj.file_path);
+                info_s = whos(mf, 'Samples');
+                C_phys = info_s.size(2);
+            end
 
-            % Resize and append columns
-            obj.h5_resize_and_append_cols(obj.file_path, '/Samples', [N_old, C_total], Samples, C_old);
+            if C_total > C_phys
+                % Need to resize
+                N_phys = obj.N_allocated;
+                if isempty(N_phys)
+                    mf = matfile(obj.file_path);
+                    info_t = whos(mf, 't');
+                    N_phys = info_t.size(1);
+                end
+                obj.h5_resize_and_append_cols(obj.file_path, '/Samples', [N_phys, C_total], Samples, C_old);
+                obj.C_allocated = C_total;
+            else
+                % Write within pre-allocated space
+                TEA.h5_write_hyperslab(obj.file_path, '/Samples', Samples, [0, C_old]);
+            end
+
+            obj.C_written = C_total;
 
             % Update ch_map
             mf = matfile(obj.file_path, 'Writable', true);
@@ -335,6 +400,55 @@ classdef TEA < handle
             end
 
             fprintf('TEA channels appended: %s (now %d channels)\n', obj.file_path, C_total);
+        end
+
+        %% ============ FINALIZE ============
+        function finalize(obj)
+        % FINALIZE Trim pre-allocated datasets to actual written size.
+        %
+        %   tea.finalize()
+        %
+        %   Must be called after all writes are complete when using
+        %   expected_length or expected_channels. Safe to call without
+        %   pre-allocation (no-op).
+
+            if ~obj.is_initialized, return; end
+            if isempty(obj.N_written) || isempty(obj.C_written), return; end
+
+            N = obj.N_written;
+            C = obj.C_written;
+
+            % Get physical sizes
+            mf = matfile(obj.file_path);
+            info_t = whos(mf, 't');
+            info_s = whos(mf, 'Samples');
+            N_phys = info_t.size(1);
+            C_phys = info_s.size(2);
+
+            needs_trim = (N_phys ~= N) || (C_phys ~= C);
+            if needs_trim
+                % Trim t
+                fid = H5F.open(obj.file_path, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
+                dset_t = H5D.open(fid, '/t');
+                H5D.set_extent(dset_t, fliplr([N, 1]));
+                H5D.close(dset_t);
+                % Trim Samples
+                dset_s = H5D.open(fid, '/Samples');
+                H5D.set_extent(dset_s, fliplr([N, C]));
+                H5D.close(dset_s);
+                H5F.close(fid);
+                fprintf('TEA finalized: trimmed from (%d,%d) to (%d,%d)\n', N_phys, C_phys, N, C);
+            end
+
+            % Rewrite dependents
+            mf = matfile(obj.file_path, 'Writable', true);
+            t_data = mf.t;
+            obj.write_dependents(mf, t_data);
+
+            obj.N_allocated = N;
+            obj.C_allocated = C;
+
+            fprintf('TEA finalized: %s (%d samples, %d channels)\n', obj.file_path, N, C);
         end
 
         %% ============ READ ============
@@ -800,9 +914,10 @@ classdef TEA < handle
     %% ============ STATIC METHODS ============
     methods (Static, Access = private)
 
-        function h5_init_dataset(filename, var, sz, var_class)
+        function h5_init_dataset(filename, var, sz, var_class, do_compress)
         % Create a chunked HDF5 dataset with unlimited max dimensions.
         %   Adapted from savefast.m by Timothy E. Holy (2013).
+            if nargin < 5, do_compress = false; end
             [fp, fb, ext] = fileparts(filename);
             if isempty(ext), filename = fullfile(fp, [fb '.mat']); end
 
@@ -817,10 +932,18 @@ classdef TEA < handle
             varname = ['/' var];
             chunk_rows = min(32000, max(1, sz(1)));
             chunk_cols = max(1, sz(2));
+            if do_compress
+                deflate_level = 1;
+                shuffle_flag = true;
+            else
+                deflate_level = 0;
+                shuffle_flag = false;
+            end
             h5create(filename, varname, [Inf, Inf], ...
                 'DataType', var_class, ...
                 'ChunkSize', [chunk_rows, chunk_cols], ...
-                'Deflate', 0);
+                'Deflate', deflate_level, ...
+                'Shuffle', shuffle_flag);
 
             fid = H5F.open(filename, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
             dset_id = H5D.open(fid, varname);
@@ -850,6 +973,19 @@ classdef TEA < handle
             H5S.select_hyperslab(space_id, 'H5S_SELECT_SET', fliplr([0, col_offset]), [], fliplr([nr, nc]), []);
             mem_space = H5S.create_simple(2, fliplr([nr, nc]), []);
             H5D.write(dset_id, 'H5ML_DEFAULT', mem_space, space_id, 'H5P_DEFAULT', new_data);
+            H5S.close(mem_space); H5S.close(space_id); H5D.close(dset_id); H5F.close(fid);
+        end
+
+        function h5_write_hyperslab(file_path, dataset_name, data, offset)
+        % Write data into existing dataset at given offset [row_offset, col_offset]
+        % without resizing the dataset.
+            fid = H5F.open(file_path, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
+            dset_id = H5D.open(fid, dataset_name);
+            space_id = H5D.get_space(dset_id);
+            nr = size(data, 1); nc = size(data, 2);
+            H5S.select_hyperslab(space_id, 'H5S_SELECT_SET', fliplr(offset), [], fliplr([nr, nc]), []);
+            mem_space = H5S.create_simple(2, fliplr([nr, nc]), []);
+            H5D.write(dset_id, 'H5ML_DEFAULT', mem_space, space_id, 'H5P_DEFAULT', data);
             H5S.close(mem_space); H5S.close(space_id); H5D.close(dset_id); H5F.close(fid);
         end
 

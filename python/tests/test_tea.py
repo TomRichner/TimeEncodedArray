@@ -675,3 +675,205 @@ class TestPrecisionWarning:
         with pytest.warns(UserWarning, match="precision"):
             tea.write(t_abs, np.random.randn(100, 1))
 
+
+# ============ Test 32: Compression ============
+
+class TestCompression:
+    def test_roundtrip(self, temp_dir):
+        """Write with compress=True, verify data and HDF5 filter."""
+        f = os.path.join(temp_dir, 'comp.mat')
+        SR = 1000
+        N = 5000
+        t = np.arange(N) / SR
+        samples = np.random.randn(N, 3)
+
+        tea = TEA(f, SR, True, compress=True)
+        tea.write(t, samples)
+
+        # Read back and verify data
+        Data, t_out, di = tea.read()
+        np.testing.assert_allclose(t_out, t, atol=1e-12)
+        np.testing.assert_allclose(Data, samples, atol=1e-12)
+        assert not di['is_discontinuous']
+
+        # Verify HDF5 datasets have gzip compression
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['t'].compression == 'gzip'
+            assert hf['t'].compression_opts == 1
+            assert hf['t'].shuffle is True
+            assert hf['Samples'].compression == 'gzip'
+            assert hf['Samples'].compression_opts == 1
+            assert hf['Samples'].shuffle is True
+
+    def test_append_preserves_compression(self, temp_dir):
+        """Appended data should also be compressed."""
+        f = os.path.join(temp_dir, 'comp_app.mat')
+        SR = 1000
+        N = 2000
+
+        tea = TEA(f, SR, True, compress=True)
+        t1 = np.arange(N) / SR
+        tea.write(t1, np.random.randn(N, 2))
+
+        t2 = t1[-1] + np.arange(1, N + 1) / SR
+        tea.write(t2, np.random.randn(N, 2))
+
+        assert tea.N == 2 * N
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['Samples'].compression == 'gzip'
+
+    def test_default_no_compression(self, temp_dir):
+        """Default (compress=False) should have no compression."""
+        f = os.path.join(temp_dir, 'nocomp.mat')
+        SR = 1000
+        t = np.arange(1000) / SR
+
+        tea = TEA(f, SR, True)
+        tea.write(t, np.random.randn(1000, 2))
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['Samples'].compression is None
+
+
+# ============ Test: Pre-allocation ============
+
+class TestPreallocation:
+    def test_preallocate_roundtrip(self, temp_dir):
+        """Write once within budget, finalize, read back."""
+        f = mat_path(temp_dir, 'prealloc_rt')
+        SR = 1000
+        N = 3000
+        C = 4
+        t = np.arange(N) / SR
+        samples = np.random.randn(N, C)
+
+        tea = TEA(f, SR, True, t_units='s', expected_length=10000, expected_channels=C)
+        tea.write(t, samples)
+
+        # Before finalize: logical N should be correct
+        assert tea.N == N
+        assert tea.C == C
+
+        tea.finalize()
+
+        assert tea.N == N
+        assert tea.C == C
+
+        Data, t_out, di = tea.read()
+        np.testing.assert_allclose(t_out, t, atol=1e-12)
+        np.testing.assert_allclose(Data, samples, atol=1e-12)
+
+    def test_preallocate_multiple_writes(self, temp_dir):
+        """Stream multiple writes within budget, finalize, verify."""
+        f = mat_path(temp_dir, 'prealloc_multi')
+        SR = 500
+        C = 3
+        chunk_size = 1000
+
+        tea = TEA(f, SR, True, t_units='s', expected_length=5000)
+
+        all_t = []
+        all_samples = []
+        for i in range(4):  # 4 x 1000 = 4000 < 5000
+            t = (i * chunk_size + np.arange(chunk_size)) / SR
+            s = np.random.randn(chunk_size, C)
+            tea.write(t, s)
+            all_t.append(t)
+            all_samples.append(s)
+
+        assert tea.N == 4000
+        tea.finalize()
+        assert tea.N == 4000
+
+        Data, t_out, _ = tea.read()
+        np.testing.assert_allclose(t_out, np.concatenate(all_t), atol=1e-12)
+        np.testing.assert_allclose(Data, np.vstack(all_samples), atol=1e-12)
+
+        # Verify physical size matches logical after finalize
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['t'].shape == (1, 4000)
+            assert hf['Samples'].shape == (C, 4000)
+
+    def test_preallocate_exceeds(self, temp_dir):
+        """Write past expected_length — verify auto-resize works."""
+        f = mat_path(temp_dir, 'prealloc_exceed')
+        SR = 1000
+        C = 2
+
+        tea = TEA(f, SR, True, t_units='s', expected_length=500)
+
+        # Write 500, then 500 more (total 1000 > 500 allocation)
+        t1 = np.arange(500) / SR
+        tea.write(t1, np.random.randn(500, C))
+
+        t2 = (500 + np.arange(500)) / SR
+        s2 = np.random.randn(500, C)
+        tea.write(t2, s2)  # should auto-resize
+
+        assert tea.N == 1000
+        tea.finalize()
+
+        Data, t_out, _ = tea.read()
+        assert len(t_out) == 1000
+        np.testing.assert_allclose(Data[500:, :], s2, atol=1e-12)
+
+    def test_preallocate_channels(self, temp_dir):
+        """Pre-allocate channels, add via write_channels(), finalize."""
+        f = mat_path(temp_dir, 'prealloc_ch')
+        SR = 1000
+        N = 2000
+        t = np.arange(N) / SR
+        initial_samples = np.random.randn(N, 2)
+
+        tea = TEA(f, SR, True, t_units='s', expected_channels=10)
+        tea.write(t, initial_samples)
+
+        assert tea.C == 2
+
+        # Add 3 more channels
+        extra = np.random.randn(N, 3)
+        tea.write_channels(extra)
+
+        assert tea.C == 5
+
+        tea.finalize()
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['Samples'].shape == (5, N)
+
+        Data, _, _ = tea.read()
+        np.testing.assert_allclose(Data[:, :2], initial_samples, atol=1e-12)
+        np.testing.assert_allclose(Data[:, 2:5], extra, atol=1e-12)
+
+    def test_default_no_preallocation(self, temp_dir):
+        """Default behavior unchanged when no expected_length/channels given."""
+        f = mat_path(temp_dir, 'no_prealloc')
+        SR = 1000
+        N = 1000
+        C = 2
+        t = np.arange(N) / SR
+        samples = np.random.randn(N, C)
+
+        tea = TEA(f, SR, True, t_units='s')
+        tea.write(t, samples)
+
+        assert tea.N == N
+        assert tea.C == C
+
+        # finalize is safe to call even without pre-allocation
+        tea.finalize()
+
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['t'].shape == (1, N)
+            assert hf['Samples'].shape == (C, N)
+
+        Data, t_out, _ = tea.read()
+        np.testing.assert_allclose(t_out, t, atol=1e-12)
+        np.testing.assert_allclose(Data, samples, atol=1e-12)

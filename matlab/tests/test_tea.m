@@ -550,6 +550,174 @@ classdef test_tea < matlab.unittest.TestCase
             t_abs = 1.77e15 + (0:99)';  % absolute posix microseconds
             tc.verifyWarning(@() tea.write(t_abs, randn(100, 1)), 'TEA:PrecisionLoss');
         end
+        %% Test 31: Compression (DEFLATE + shuffle)
+        function test_compression(tc)
+            f = fullfile(tc.temp_dir, 'comp.mat');
+            SR = 1000; N = 5000;
+            t = (0:N-1)' / SR;
+            Samples = randn(N, 3);
+
+            tea = TEA(f, SR, true, 'compress', true);
+            tea.write(t, Samples);
+
+            % Read back and verify data
+            [Data, t_out, di] = tea.read([], [], []);
+            tc.verifyEqual(t_out, t, 'AbsTol', 1e-12);
+            tc.verifyEqual(Data, Samples, 'AbsTol', 1e-12);
+            tc.verifyFalse(di.is_discontinuous);
+
+            % Verify HDF5 filters via h5info on the dataset
+            ds_info = h5info(f, '/Samples');
+            has_deflate = false;
+            has_shuffle = false;
+            deflate_level = 0;
+            for k = 1:numel(ds_info.Filters)
+                if strcmpi(ds_info.Filters(k).Name, 'deflate')
+                    has_deflate = true;
+                    deflate_level = ds_info.Filters(k).Data;
+                end
+                if strcmpi(ds_info.Filters(k).Name, 'shuffle')
+                    has_shuffle = true;
+                end
+            end
+            tc.verifyTrue(has_deflate, 'Samples should use deflate');
+            tc.verifyTrue(has_shuffle, 'Samples should use shuffle');
+            tc.verifyEqual(deflate_level, 1, 'Deflate level should be 1');
+        end
+
+        %% Test 32: Default no compression
+        function test_default_no_compression(tc)
+            f = fullfile(tc.temp_dir, 'nocomp.mat');
+            SR = 1000;
+            t = (0:999)' / SR;
+
+            tea = TEA(f, SR, true);
+            tea.write(t, randn(1000, 2));
+
+            % Deflate filter is present even at level 0, so check level
+            ds_info = h5info(f, '/Samples');
+            for k = 1:numel(ds_info.Filters)
+                if strcmpi(ds_info.Filters(k).Name, 'deflate')
+                    tc.verifyEqual(ds_info.Filters(k).Data, 0, ...
+                        'Default should have deflate level 0 (no compression)');
+                end
+                tc.verifyFalse(strcmpi(ds_info.Filters(k).Name, 'shuffle'), ...
+                    'Default should not use shuffle');
+            end
+        end
+
+        %% Test 33: Pre-allocate roundtrip
+        function test_preallocate_roundtrip(tc)
+            f = fullfile(tc.temp_dir, 'prealloc_rt.mat');
+            SR = 1000; N = 3000; C = 4;
+            t = (0:N-1)' / SR;
+            samples = randn(N, C);
+
+            tea = TEA(f, SR, true, 't_units', 's', 'expected_length', 10000, 'expected_channels', C);
+            tea.write(t, samples);
+            tc.verifyEqual(tea.N, N);
+            tc.verifyEqual(tea.C, C);
+
+            tea.finalize();
+            tc.verifyEqual(tea.N, N);
+
+            [D, t_out, ~] = tea.read();
+            tc.verifyEqual(t_out, t, 'AbsTol', 1e-12);
+            tc.verifyEqual(D, samples, 'AbsTol', 1e-12);
+        end
+
+        %% Test 34: Pre-allocate multiple writes
+        function test_preallocate_multiple_writes(tc)
+            f = fullfile(tc.temp_dir, 'prealloc_multi.mat');
+            SR = 500; C = 3; chunk_size = 1000;
+
+            tea = TEA(f, SR, true, 't_units', 's', 'expected_length', 5000);
+
+            all_t = []; all_s = [];
+            for i = 0:3  % 4 x 1000 = 4000 < 5000
+                t = ((i*chunk_size):(i*chunk_size + chunk_size - 1))' / SR;
+                s = randn(chunk_size, C);
+                tea.write(t, s);
+                all_t = [all_t; t]; %#ok<AGROW>
+                all_s = [all_s; s]; %#ok<AGROW>
+            end
+
+            tc.verifyEqual(tea.N, 4000);
+            tea.finalize();
+
+            info_t = h5info(f, '/t');
+            tc.verifyEqual(info_t.Dataspace.Size, [4000 1]);
+
+            [D, t_out, ~] = tea.read();
+            tc.verifyEqual(t_out, all_t, 'AbsTol', 1e-12);
+            tc.verifyEqual(D, all_s, 'AbsTol', 1e-12);
+        end
+
+        %% Test 35: Pre-allocate exceeds
+        function test_preallocate_exceeds(tc)
+            f = fullfile(tc.temp_dir, 'prealloc_exceed.mat');
+            SR = 1000; C = 2;
+
+            tea = TEA(f, SR, true, 't_units', 's', 'expected_length', 500);
+
+            t1 = (0:499)' / SR;
+            tea.write(t1, randn(500, C));
+
+            t2 = (500:999)' / SR;
+            s2 = randn(500, C);
+            tea.write(t2, s2);  % should auto-resize
+
+            tc.verifyEqual(tea.N, 1000);
+            tea.finalize();
+
+            [D, t_out, ~] = tea.read();
+            tc.verifyEqual(length(t_out), 1000);
+            tc.verifyEqual(D(501:end, :), s2, 'AbsTol', 1e-12);
+        end
+
+        %% Test 36: Pre-allocate channels
+        function test_preallocate_channels(tc)
+            f = fullfile(tc.temp_dir, 'prealloc_ch.mat');
+            SR = 1000; N = 2000;
+            t = (0:N-1)' / SR;
+            initial = randn(N, 2);
+
+            tea = TEA(f, SR, true, 't_units', 's', 'expected_channels', 10);
+            tea.write(t, initial);
+            tc.verifyEqual(tea.C, 2);
+
+            extra = randn(N, 3);
+            tea.write_channels(extra);
+            tc.verifyEqual(tea.C, 5);
+
+            tea.finalize();
+
+            info_s = h5info(f, '/Samples');
+            tc.verifyEqual(info_s.Dataspace.Size, [N 5]);
+
+            [D, ~, ~] = tea.read();
+            tc.verifyEqual(D(:, 1:2), initial, 'AbsTol', 1e-12);
+            tc.verifyEqual(D(:, 3:5), extra, 'AbsTol', 1e-12);
+        end
+
+        %% Test 37: Default no preallocation
+        function test_default_no_preallocation(tc)
+            f = fullfile(tc.temp_dir, 'no_prealloc.mat');
+            SR = 1000; N = 1000; C = 2;
+            t = (0:N-1)' / SR;
+            samples = randn(N, C);
+
+            tea = TEA(f, SR, true, 't_units', 's');
+            tea.write(t, samples);
+            tea.finalize();  % safe no-op
+
+            info_t = h5info(f, '/t');
+            tc.verifyEqual(info_t.Dataspace.Size, [N 1]);
+
+            [D, t_out, ~] = tea.read();
+            tc.verifyEqual(t_out, t, 'AbsTol', 1e-12);
+            tc.verifyEqual(D, samples, 'AbsTol', 1e-12);
+        end
 
     end
 end

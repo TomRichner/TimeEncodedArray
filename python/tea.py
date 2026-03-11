@@ -42,7 +42,10 @@ class TEA:
     def __init__(self, file_path: str, SR: float | None, is_regular: bool, *,
                  t_units: str = '', t_offset: int | float | None = None,
                  t_offset_units: str = '', t_offset_scale: float = 1.0,
-                 hdr: dict | None = None, tea_version: str = '1.0') -> None:
+                 hdr: dict | None = None, tea_version: str = '1.0',
+                 compress: bool = False,
+                 expected_length: int | None = None,
+                 expected_channels: int | None = None) -> None:
         """
         Create or bind to a TEA file.
 
@@ -56,6 +59,9 @@ class TEA:
             t_offset_scale: Conversion factor from t_offset units to t units
             hdr: Free-form metadata dict
             tea_version: Format version string
+            compress: If True, use DEFLATE level 1 + shuffle on t and Samples
+            expected_length: Pre-allocate N samples (avoids resize on append)
+            expected_channels: Pre-allocate C channels (avoids resize on write_channels)
         """
         self._file_path = str(file_path)
         self._SR = float(SR) if SR is not None else None
@@ -66,7 +72,16 @@ class TEA:
         self._t_offset_scale = float(t_offset_scale)
         self.hdr = hdr if hdr is not None else {}
         self.tea_version = str(tea_version)
+        self._compress = bool(compress)
+        self._expected_length = int(expected_length) if expected_length is not None else None
+        self._expected_channels = int(expected_channels) if expected_channels is not None else None
         self._is_initialized = False
+
+        # Pre-allocation tracking (logical vs physical sizes)
+        self._N_written: int | None = None   # logical sample count
+        self._C_written: int | None = None   # logical channel count
+        self._N_allocated: int | None = None  # physical allocation (N dimension)
+        self._C_allocated: int | None = None  # physical allocation (C dimension)
 
         # Validate SR
         if is_regular:
@@ -116,20 +131,22 @@ class TEA:
 
     @property
     def N(self) -> int:
-        """Total sample count (read from file)."""
+        """Total sample count (logical, not physical allocation)."""
+        if self._N_written is not None:
+            return self._N_written
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            # t stored as HDF5 (1, N) for MATLAB [N, 1]
             return f['t'].shape[1]
 
     @property
     def C(self) -> int:
-        """Channel count (read from file)."""
+        """Channel count (logical, not physical allocation)."""
+        if self._C_written is not None:
+            return self._C_written
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            # Samples stored as HDF5 (C, N) for MATLAB [N, C]
             return f['Samples'].shape[0]
 
     @property
@@ -231,18 +248,23 @@ class TEA:
         samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
 
         with h5py.File(self._file_path, 'r+') as f:
-            N_file = f['t'].shape[1]
-            C_old = f['Samples'].shape[0]
+            N_written = self._N_written if self._N_written is not None else f['t'].shape[1]
+            C_old = self._C_written if self._C_written is not None else f['Samples'].shape[0]
             N_new, C_new = samples.shape
 
-            if N_new != N_file:
-                raise ValueError(f"New channels must have {N_file} rows, but has {N_new}")
+            if N_new != N_written:
+                raise ValueError(f"New channels must have {N_written} rows, but has {N_new}")
 
             C_total = C_old + C_new
+            C_phys = self._C_allocated or f['Samples'].shape[0]
+            N_phys = self._N_allocated or f['Samples'].shape[1]
 
-            # Resize and append columns
-            f['Samples'].resize((C_total, N_file))
-            f['Samples'][C_old:C_total, :] = samples.T
+            # Resize only if we exceed the allocated channel space
+            if C_total > C_phys:
+                f['Samples'].resize((C_total, N_phys))
+                self._C_allocated = C_total
+
+            f['Samples'][C_old:C_total, :N_written] = samples.T
 
             # Update ch_map
             if 'ch_map' in f:
@@ -257,8 +279,47 @@ class TEA:
 
             self._write_h5_array(f, 'ch_map', new_map.reshape(1, -1))  # MATLAB [1, C]
 
+        self._C_written = C_total
         logger.info("TEA channels appended: %s (now %d channels)",
                     self._file_path, C_total)
+
+    # ============ Finalize ============
+
+    def finalize(self) -> None:
+        """
+        Trim pre-allocated datasets to actual written size and update dependents.
+
+        Must be called after all writes are complete when using expected_length
+        or expected_channels. Safe to call even without pre-allocation (no-op).
+        """
+        if not self._is_initialized:
+            return
+
+        N = self._N_written
+        C = self._C_written
+        if N is None or C is None:
+            return  # nothing to finalize
+
+        with h5py.File(self._file_path, 'r+') as f:
+            N_phys = f['t'].shape[1]
+            C_phys = f['Samples'].shape[0]
+
+            needs_trim = (N_phys != N) or (C_phys != C)
+            if needs_trim:
+                f['t'].resize((1, N))
+                f['Samples'].resize((C, N))
+                logger.info("TEA finalized: trimmed from (%d, %d) to (%d, %d)",
+                            C_phys, N_phys, C, N)
+
+            # Rewrite dependents based on actual data
+            t = f['t'][0, :N]
+            self._write_dependents(f, t)
+
+        self._N_allocated = N
+        self._C_allocated = C
+
+        logger.info("TEA finalized: %s (%d samples, %d channels)",
+                    self._file_path, N, C)
 
     # ============ Read ============
 
@@ -395,7 +456,18 @@ class TEA:
 
     def _create_file(self, t: ArrayFloat64, samples: ArrayFloat64) -> None:
         N, C = len(t), samples.shape[1]
-        chunk_n = min(32000, max(1, N))
+
+        # Determine allocation sizes
+        N_alloc = max(N, self._expected_length or N)
+        C_alloc = max(C, self._expected_channels or C)
+        chunk_n = min(32000, max(1, N_alloc))
+        chunk_c = max(1, C_alloc)
+
+        # Compression kwargs for t and Samples datasets
+        comp_kwargs = {}
+        if self._compress:
+            comp_kwargs = {'compression': 'gzip', 'compression_opts': 1,
+                           'shuffle': True}
 
         # Create HDF5 file with 512-byte userblock for MATLAB v7.3 compatibility
         with h5py.File(self._file_path, 'w', userblock_size=512) as f:
@@ -403,20 +475,23 @@ class TEA:
             if self._SR is not None:
                 self._write_h5_scalar(f, 'SR', np.float64(self._SR))
             else:
-                # MATLAB stores [] as uint64([0,0]) with MATLAB_empty=1
                 ds_sr = f.create_dataset('SR', data=np.array([0, 0], dtype=np.uint64))
                 ds_sr.attrs['MATLAB_class'] = np.bytes_('double')
                 ds_sr.attrs['MATLAB_empty'] = np.uint8(1)
             # isRegular
             self._write_h5_scalar(f, 'isRegular', self._is_regular, logical=True)
-            # t: MATLAB [N,1] → HDF5 (1, N)
-            ds_t = f.create_dataset('t', data=t.reshape(1, -1),
-                             maxshape=(1, None), chunks=(1, chunk_n))
+            # t: HDF5 (1, N_alloc), write first N values
+            ds_t = f.create_dataset('t', shape=(1, N_alloc),
+                             maxshape=(1, None), chunks=(1, chunk_n),
+                             dtype=np.float64, **comp_kwargs)
             ds_t.attrs['MATLAB_class'] = np.bytes_('double')
-            # Samples: MATLAB [N,C] → HDF5 (C, N)
-            ds_s = f.create_dataset('Samples', data=samples.T,
-                             maxshape=(None, None), chunks=(max(1, C), chunk_n))
+            ds_t[0, :N] = t
+            # Samples: HDF5 (C_alloc, N_alloc), write first (C, N) values
+            ds_s = f.create_dataset('Samples', shape=(C_alloc, N_alloc),
+                             maxshape=(None, None), chunks=(chunk_c, chunk_n),
+                             dtype=np.float64, **comp_kwargs)
             ds_s.attrs['MATLAB_class'] = np.bytes_('double')
+            ds_s[:C, :N] = samples.T
             # String metadata
             self._write_h5_string(f, 'tea_version', self.tea_version)
             if self.t_units:
@@ -431,6 +506,12 @@ class TEA:
 
         # Write the 128-byte MATLAB v7.3 header into the userblock
         self._write_matlab_header(self._file_path)
+
+        # Track logical and physical sizes
+        self._N_written = N
+        self._C_written = C
+        self._N_allocated = N_alloc
+        self._C_allocated = C_alloc
 
     @staticmethod
     def _write_matlab_header(file_path: str) -> None:
@@ -455,8 +536,9 @@ class TEA:
         N_new, C_new = len(t), samples.shape[1]
 
         with h5py.File(self._file_path, 'r+') as f:
-            N_old = f['t'].shape[1]
-            C_old = f['Samples'].shape[0]
+            # Use logical sizes (handles pre-allocated files)
+            N_old = self._N_written if self._N_written is not None else f['t'].shape[1]
+            C_old = self._C_written if self._C_written is not None else f['Samples'].shape[0]
 
             if C_new != C_old:
                 raise ValueError(
@@ -469,17 +551,21 @@ class TEA:
                     f"New t must start after existing t. Last: {t_last}, first new: {t[0]}")
 
             N_total = N_old + N_new
+            N_phys = self._N_allocated or f['t'].shape[1]
 
-            # Resize and append
-            f['t'].resize((1, N_total))
+            # Resize only if we exceed the allocated space
+            if N_total > N_phys:
+                f['t'].resize((1, N_total))
+                f['Samples'].resize((f['Samples'].shape[0], N_total))
+                self._N_allocated = N_total
+
             f['t'][0, N_old:N_total] = t
-
-            f['Samples'].resize((C_old, N_total))
-            f['Samples'][:, N_old:N_total] = samples.T
+            f['Samples'][:C_old, N_old:N_total] = samples.T
 
             # Update dependents incrementally
             self._update_dependents_incremental(f, t, t_last, N_old, N_total)
 
+        self._N_written = N_total
         logger.info("TEA file appended: %s (now %d samples)",
                     self._file_path, N_total)
 
