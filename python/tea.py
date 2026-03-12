@@ -504,6 +504,10 @@ class TEA:
             # Dependent variables
             self._write_dependents(f, t)
 
+            # hdr: free-form metadata stored as MATLAB struct group
+            if self.hdr:
+                self._write_hdr_fields(f, self.hdr)
+
         # Write the 128-byte MATLAB v7.3 header into the userblock
         self._write_matlab_header(self._file_path)
 
@@ -838,3 +842,46 @@ class TEA:
         ds = f.create_dataset(name, data=encoded)
         ds.attrs['MATLAB_class'] = np.bytes_('char')
         ds.attrs['MATLAB_int_decode'] = np.int32(2)
+
+    @staticmethod
+    def _write_hdr_fields(f: h5py.File, hdr_dict: dict) -> None:
+        """Write hdr dict as a MATLAB-compatible struct group.
+
+        Creates an HDF5 group '/hdr' with MATLAB_class='struct'.
+        Each dict key becomes a field in the struct:
+          - list[str]  → 2D char matrix (use cellstr() in MATLAB)
+          - str        → char row vector
+          - int/float  → double scalar
+          - np.ndarray → double array
+        """
+        if 'hdr' in f:
+            del f['hdr']
+        hdr_grp = f.create_group('hdr')
+        hdr_grp.attrs['MATLAB_class'] = np.bytes_('struct')
+
+        for key, val in hdr_dict.items():
+            if isinstance(val, list) and len(val) > 0 and all(isinstance(v, str) for v in val):
+                # List of strings → 2D char matrix (MATLAB char array)
+                # MATLAB: cellstr(hdr.field) to get cell array of strings
+                max_len = max(len(s) for s in val)
+                char_arr = np.zeros((len(val), max_len), dtype=np.uint16)
+                for i, s in enumerate(val):
+                    for j, ch in enumerate(s):
+                        char_arr[i, j] = ord(ch)
+                # Transpose: MATLAB (N, M) stored as HDF5 (M, N)
+                ds = hdr_grp.create_dataset(key, data=char_arr.T)
+                ds.attrs['MATLAB_class'] = np.bytes_('char')
+                ds.attrs['MATLAB_int_decode'] = np.int32(2)
+            elif isinstance(val, str):
+                encoded = np.array([ord(c) for c in val], dtype=np.uint16).reshape(-1, 1)
+                ds = hdr_grp.create_dataset(key, data=encoded)
+                ds.attrs['MATLAB_class'] = np.bytes_('char')
+                ds.attrs['MATLAB_int_decode'] = np.int32(2)
+            elif isinstance(val, (int, float, np.integer, np.floating)):
+                ds = hdr_grp.create_dataset(key, data=np.array([[np.float64(val)]]))
+                ds.attrs['MATLAB_class'] = np.bytes_('double')
+            elif isinstance(val, np.ndarray):
+                arr = val.astype(np.float64)
+                stored = arr.T if arr.ndim > 1 else arr.reshape(1, -1)
+                ds = hdr_grp.create_dataset(key, data=stored)
+                ds.attrs['MATLAB_class'] = np.bytes_('double')
