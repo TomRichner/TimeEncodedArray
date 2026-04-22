@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tea"
+version = "0.1.0"
+description = "TEA (Time-Encoded Array) — standardized timeseries format on HDF5/MATLAB v7.3."
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Tom Richner", email = "tomrichner@gmail.com" }]
+dependencies = [
+    "numpy",
+    "h5py",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/TomRichner/TimeEncodedArray"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+py-modules = ["tea"]
+
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["python/tests"]
