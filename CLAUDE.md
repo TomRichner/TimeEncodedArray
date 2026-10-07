@@ -46,7 +46,7 @@ Cross-validation: run `write_test_cases` in one language, `compare_test_cases` i
 ## Public API (symmetric across MATLAB / Python)
 
 - **Constructor:** `TEA(file_path, SR, isRegular, varargin)` / `TEA(file_path, SR, is_regular, **kwargs)`.
-  Optional: `t_units`, `t_offset`, `t_offset_units`, `t_offset_scale`, `hdr` (free-form metadata struct/dict), `compress` (DEFLATE level 1 + shuffle), `expected_length`, `expected_channels` (pre-allocation).
+  Optional: `t_units`, `t_offset`, `t_offset_units`, `t_offset_scale`, `hdr` (free-form metadata struct/dict), `compress` (DEFLATE level 1, no shuffle), `expected_length`, `expected_channels` (pre-allocation).
 - `write(t, Samples)` — append; enforces monotonicity (`t(1) > t_last`).
 - `write_absolute(t_abs, Samples)` — append with absolute timestamps.
 - `write_channels(Samples, ch_map)` — add new channel columns.

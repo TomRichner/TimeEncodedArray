@@ -701,10 +701,10 @@ class TestCompression:
         with h5py.File(f, 'r') as hf:
             assert hf['t'].compression == 'gzip'
             assert hf['t'].compression_opts == 1
-            assert hf['t'].shuffle is True
+            assert hf['t'].shuffle is False
             assert hf['Samples'].compression == 'gzip'
             assert hf['Samples'].compression_opts == 1
-            assert hf['Samples'].shuffle is True
+            assert hf['Samples'].shuffle is False
 
     def test_append_preserves_compression(self, temp_dir):
         """Appended data should also be compressed."""

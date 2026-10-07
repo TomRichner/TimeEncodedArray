@@ -31,7 +31,7 @@ classdef TEA < handle
         file_path   char        % Path to the HDF5/.mat file
         SR          double      % Sample rate (samples/t_units), [] for irregular
         isRegular   logical     % true = regularly spaced samples
-        compress    logical     % true = DEFLATE level 1 + shuffle on t and Samples
+        compress    logical     % true = DEFLATE level 1 (no shuffle) on t and Samples
     end
 
     properties
@@ -934,16 +934,18 @@ classdef TEA < handle
             chunk_cols = max(1, sz(2));
             if do_compress
                 deflate_level = 1;
-                shuffle_flag = true;
             else
                 deflate_level = 0;
-                shuffle_flag = false;
             end
+            % No shuffle filter: sampled data is usually integer ADC counts
+            % times a scale factor, so whole 8-byte values repeat and DEFLATE
+            % finds them. Shuffle splits those values into byte lanes and
+            % hides the repeats (measured on EEG: 2.4x larger files and slower).
             h5create(filename, varname, [Inf, Inf], ...
                 'DataType', var_class, ...
                 'ChunkSize', [chunk_rows, chunk_cols], ...
                 'Deflate', deflate_level, ...
-                'Shuffle', shuffle_flag);
+                'Shuffle', false);
 
             fid = H5F.open(filename, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
             dset_id = H5D.open(fid, varname);

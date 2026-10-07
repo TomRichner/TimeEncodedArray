@@ -550,7 +550,7 @@ classdef test_tea < matlab.unittest.TestCase
             t_abs = 1.77e15 + (0:99)';  % absolute posix microseconds
             tc.verifyWarning(@() tea.write(t_abs, randn(100, 1)), 'TEA:PrecisionLoss');
         end
-        %% Test 31: Compression (DEFLATE + shuffle)
+        %% Test 31: Compression (DEFLATE, no shuffle)
         function test_compression(tc)
             f = fullfile(tc.temp_dir, 'comp.mat');
             SR = 1000; N = 5000;
@@ -581,7 +581,7 @@ classdef test_tea < matlab.unittest.TestCase
                 end
             end
             tc.verifyTrue(has_deflate, 'Samples should use deflate');
-            tc.verifyTrue(has_shuffle, 'Samples should use shuffle');
+            tc.verifyFalse(has_shuffle, 'Samples should not use shuffle');
             tc.verifyEqual(deflate_level, 1, 'Deflate level should be 1');
         end
 

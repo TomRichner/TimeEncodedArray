@@ -59,7 +59,7 @@ class TEA:
             t_offset_scale: Conversion factor from t_offset units to t units
             hdr: Free-form metadata dict
             tea_version: Format version string
-            compress: If True, use DEFLATE level 1 + shuffle on t and Samples
+            compress: If True, use DEFLATE level 1 (no shuffle) on t and Samples
             expected_length: Pre-allocate N samples (avoids resize on append)
             expected_channels: Pre-allocate C channels (avoids resize on write_channels)
         """
@@ -464,10 +464,13 @@ class TEA:
         chunk_c = max(1, C_alloc)
 
         # Compression kwargs for t and Samples datasets
+        # No shuffle filter: sampled data is usually integer ADC counts times a
+        # scale factor, so whole 8-byte values repeat and DEFLATE finds them.
+        # Shuffle splits those values into byte lanes and hides the repeats
+        # (measured on EEG: 2.4x larger files and slower with shuffle).
         comp_kwargs = {}
         if self._compress:
-            comp_kwargs = {'compression': 'gzip', 'compression_opts': 1,
-                           'shuffle': True}
+            comp_kwargs = {'compression': 'gzip', 'compression_opts': 1}
 
         # Create HDF5 file with 512-byte userblock for MATLAB v7.3 compatibility
         with h5py.File(self._file_path, 'w', userblock_size=512) as f:
