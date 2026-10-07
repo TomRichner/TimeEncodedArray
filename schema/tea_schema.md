@@ -119,4 +119,4 @@ Writers SHOULD warn when `ULP(t[0]) / median(diff(t)) > 0.01` (1%), indicating t
 
 ## File Format
 
-TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The recommended chunk size is `[32000, 1]` for column-oriented access.
+TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The reference implementations use chunks of 500 samples spanning all channels (`[500, C]` as MATLAB sees it), which keeps short time-window reads cheap.

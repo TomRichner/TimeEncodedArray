@@ -930,7 +930,11 @@ classdef TEA < handle
             end
 
             varname = ['/' var];
-            chunk_rows = min(32000, max(1, sz(1)));
+            % Samples per HDF5 chunk; a chunk spans all channels. Short chunks
+            % keep partial reads cheap: with 276 channels a chunk is about
+            % 1 MB, so reading a one-second window from a compressed file
+            % decompresses a megabyte or two rather than a 70 MB chunk.
+            chunk_rows = min(500, max(1, sz(1)));
             chunk_cols = max(1, sz(2));
             if do_compress
                 deflate_level = 1;
