@@ -1,10 +1,15 @@
-# TEA: Time-Encoded Array — Schema Specification v1.0
+# TEA: Time-Encoded Array — Schema Specification v2
 
 ## Overview
 
 TEA is a timeseries data format stored in HDF5/`.mat` v7.3 files. It is designed for multichannel sampled data with explicit per-sample timestamps.
 
-**One time axis per file.** Each TEA file contains a single `t` vector and a single `Samples` array. Additional arrays sharing the same `t` vector (same length, same time base) may also be stored. If data requires a different time axis or sample rate, it belongs in a separate TEA file.
+There are two schema versions:
+
+- **Version 1: one time axis per file.** The file contains a single `t` vector and a single `Samples` array at the top level. Additional arrays sharing the same `t` vector (same length, same time base) may also be stored. Sections "Variable Tiers" to "Flag Summary" below describe this layout.
+- **Version 2: one time axis per sample rate.** The file holds one group per sample rate (a *stream*) under `/rates`; each group has the version-1 layout. See [Schema Version 2](#schema-version-2-several-sample-rates). A version-2 file with one stream also carries the version-1 fields at the top level, so version-1 readers open it unchanged.
+
+A file without `schema_version` is version 1.
 
 ---
 
@@ -44,7 +49,8 @@ Derivable from required variables. They accelerate read performance and provide 
 | `ch_map` | double | `[1 × C]` | Channel identity vector mapping columns of `Samples` to source channel numbers. Defaults to `1:C` if absent |
 | `SR_original` | double | scalar | Original sample rate before decimation (equals `SR` if undecimated) |
 | `hdr` | struct | free-form | Source-specific metadata |
-| `tea_version` | char | string | Format version (e.g., `'1.0'`) |
+| `tea_version` | char | string | Format version (e.g., `'1.0'`; `'2.0'` in version-2 files) |
+| `schema_version` | double | scalar | Schema version; absent means 1. Version-2 files store `2` |
 
 Any additional user-defined variables may be stored alongside these.
 
@@ -119,4 +125,64 @@ Writers SHOULD warn when `ULP(t[0]) / median(diff(t)) > 0.01` (1%), indicating t
 
 ## File Format
 
-TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The reference implementations use chunks of 500 samples spanning all channels (`[500, C]` as MATLAB sees it), which keeps short time-window reads cheap.
+TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The reference implementations use chunks of 500 samples spanning all channels (`[500, C]` as MATLAB sees it), which keeps short time-window reads cheap. When compressed, they use DEFLATE (gzip) level 1 without the shuffle filter. Both apply to every stream of a version-2 file.
+
+Shapes in this document are as MATLAB sees them; HDF5 stores the transpose (e.g. `Samples` `[N × C]` is the HDF5 dataset `(C, N)`).
+
+---
+
+## Schema Version 2: several sample rates
+
+A recording may hold channels at different sample rates (e.g. 256 Hz EEG and 1024 Hz DC channels, or 6400 Hz and 32 kHz streams). Version 2 stores them in one file, one **stream** per sample rate.
+
+### Layout
+
+```
+/schema_version          2
+/tea_version             '2.0'
+/t_units                 's'
+/t_offset                POSIX seconds (absolute time = t_offset × t_offset_scale + t)
+/t_offset_units          'posix_s'
+/t_offset_scale          1.0
+/channel_names           [C_total × L] char   all channels, stream by stream
+/channel_rates           [C_total × 1] double sample rate of each of those channels
+/hdr                     struct (optional, free-form)
+/rates                   struct group, one subgroup per stream
+/rates/r1                struct group: first stream
+    t                    [N1 × 1]  double   timestamps, strictly increasing, gaps allowed
+    Samples              [N1 × C1] double
+    SR                   scalar             sample rate of this stream
+    isRegular            logical
+    t_coarse, df_t_coarse, isContinuous, cont, disc   (as in version 1, for this stream)
+    channel_names        [C1 × L] char      one row per channel, space padded
+    units                [C1 × L] char      one row per channel (e.g. 'uV'), space padded
+/rates/r2                second stream, same fields
+...
+```
+
+- Streams are named `r1`, `r2`, … in the order they were written; readers order them by that number. Each stream has a distinct `SR`; a stream is looked up by its rate.
+- Every stream group is a complete version-1 layout of the required and dependent variables, so the version-1 rules (discontinuity model, flags, `t_coarse`) apply within each stream. Gaps differ freely between streams.
+- `t_units`, `t_offset`, `t_offset_units` and `t_offset_scale` are shared by all streams and live only at the top level.
+- `channel_names` and `units` are char matrices so MATLAB `load` returns them without cell references; `cellstr()` turns them into cell arrays. Rows are padded with spaces; readers strip trailing spaces and NULs.
+- Groups carry `MATLAB_class = 'struct'`, so `S = load(file)` gives `S.rates.r1.Samples` etc.
+
+### One stream: version-1 compatible
+
+When the file has exactly one stream, the top level also has `t`, `Samples`, `SR`, `isRegular`, `t_coarse`, `df_t_coarse`, `isContinuous` and (when there are gaps) `cont`, `disc`. These are HDF5 hard links to the datasets in `/rates/r1`, so the samples are stored once. Version-1 readers (MATLAB and Python `TEA` from before version 2) read such a file unchanged.
+
+With more than one stream there are no top-level `t`, `Samples`, `SR` or `isRegular`; a version-1 reader cannot read the file and must use a version-2 reader.
+
+### Readers and writers
+
+- Python: `tea.write(path, [tea.Stream(rate, channel_names, units, samples, t), ...], t_offset=...)` or `tea.Writer` for writing in blocks; `tea.read(path)` opens version 1 or 2 and gives `.rates` and `.stream(rate)`.
+- MATLAB: `tea = TEA(path, rate, true)` with any rate in the file; `tea.rates`, `tea.stream(rate).read(channels, t_range, s_range)`. A version-1 file is one stream (its group is `/`).
+- The version-1 write methods (`TEA.write`, `write_channels`, `refresh`) refuse version-2 files.
+
+---
+
+## Version History
+
+| Version | Date | Change |
+|---------|------|--------|
+| 1 | | One time axis per file. |
+| 2 | 2026-10-11 | Several sample rates per file, one group per rate under `/rates`; top-level `schema_version`, `channel_names`, `channel_rates`. One-stream files keep the version-1 fields. |

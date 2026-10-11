@@ -1,8 +1,14 @@
 """
-tea.py - Python implementation of the TEA (Time-Encoded Array) class.
+tea.py - Python implementation of the TEA (Time-Encoded Array) format.
 
 Produces MATLAB v7.3 (.mat) compatible HDF5 files that can be opened
 by the MATLAB TEA class or any HDF5 reader.
+
+Two layers:
+- `TEA`: one file, one sample rate (schema version 1). Unchanged API.
+- `write` / `Writer` / `read`: schema version 2, several sample rates in one
+  file, one group per rate under `/rates`. A version-2 file with one rate also
+  carries the version-1 fields, so `TEA` and version-1 readers open it as before.
 
 Uses h5py for all HDF5 operations. The MATLAB v7.3 userblock header
 is written directly as raw bytes.
@@ -14,6 +20,8 @@ import logging
 import os
 import time
 import warnings
+from dataclasses import dataclass
+from typing import Sequence
 
 import h5py
 import numpy as np
@@ -29,6 +37,17 @@ ArrayFloat64 = npt.NDArray[np.float64]
 # one-second window from a compressed file decompresses a megabyte or two
 # rather than a 70 MB chunk (measured 30x faster than 32000, same file size).
 CHUNK_SAMPLES = 500
+
+# Highest schema version this module writes and reads.
+SCHEMA_VERSION = 2
+
+# Group holding one subgroup per sample rate in a version-2 file.
+RATES_GROUP = 'rates'
+
+# Datasets of a stream group that a one-rate version-2 file also links at the
+# top level, so version-1 readers find them where they expect them.
+_V1_LINKED = ('t', 'Samples', 'SR', 'isRegular', 't_coarse', 'df_t_coarse',
+              'isContinuous', 'cont', 'disc')
 
 
 class TEA:
@@ -82,6 +101,10 @@ class TEA:
         self._expected_length = int(expected_length) if expected_length is not None else None
         self._expected_channels = int(expected_channels) if expected_channels is not None else None
         self._is_initialized = False
+        # HDF5 group holding t/Samples: '/' for this class; a rate group for
+        # the read-only TEAStream views of a version-2 file.
+        self._group = '/'
+        self._schema_version = 1
 
         # Pre-allocation tracking (logical vs physical sizes)
         self._N_written: int | None = None   # logical sample count
@@ -117,8 +140,28 @@ class TEA:
                         raise ValueError(
                             f"isRegular mismatch: file has {file_ir} but constructor says {is_regular}")
                 self._is_initialized = ('t' in f and 'Samples' in f)
+                self._schema_version = _schema_version_of(f)
 
     # ============ Properties ============
+
+    @property
+    def schema_version(self) -> int:
+        """Schema version of the bound file (1 for a new or version-1 file)."""
+        return self._schema_version
+
+    @property
+    def rates(self) -> list[float]:
+        """Sample rates of the streams in the file (one for a version-1 file)."""
+        if not os.path.isfile(self._file_path):
+            return []
+        return read(self._file_path).rates
+
+    def stream(self, rate: float | None = None) -> 'TEAStream':
+        """Read-only view of the stream with this sample rate.
+
+        `rate` may be omitted when the file holds one stream.
+        """
+        return read(self._file_path).stream(rate)
 
     @property
     def file_path(self) -> str:
@@ -143,7 +186,7 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            return f['t'].shape[1]
+            return f[self._group]['t'].shape[1]
 
     @property
     def C(self) -> int:
@@ -153,7 +196,7 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            return f['Samples'].shape[0]
+            return f[self._group]['Samples'].shape[0]
 
     @property
     def ch_map(self) -> ArrayFloat64:
@@ -161,10 +204,17 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return np.array([], dtype=np.float64)
         with h5py.File(self._file_path, 'r') as f:
-            if 'ch_map' in f:
-                return np.squeeze(f['ch_map'][()]).ravel().astype(np.float64)
+            g = f[self._group]
+            if 'ch_map' in g:
+                return np.squeeze(g['ch_map'][()]).ravel().astype(np.float64)
             else:
                 return np.arange(1, self.C + 1, dtype=np.float64)
+
+    def _refuse_v2_write(self) -> None:
+        if self._schema_version >= 2:
+            raise RuntimeError(
+                f"{self._file_path} is a TEA version-{self._schema_version} file; "
+                "write it with tea.write() or tea.Writer, not TEA.write().")
 
     # ============ Write ============
 
@@ -179,6 +229,7 @@ class TEA:
             t: 1D array of timestamps (monotonically increasing)
             samples: 2D array of shape (N, C)
         """
+        self._refuse_v2_write()
         t = np.asarray(t, dtype=np.float64).ravel()
         samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
         if samples.ndim == 2 and samples.shape[0] == 1 and len(t) > 1:
@@ -250,6 +301,7 @@ class TEA:
         """
         if not self._is_initialized:
             raise RuntimeError("Cannot append channels before any data has been written.")
+        self._refuse_v2_write()
 
         samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
 
@@ -348,7 +400,13 @@ class TEA:
         if t_range is not None and s_range is not None:
             raise ValueError("Specify either t_range or s_range, not both.")
 
-        with h5py.File(self._file_path, 'r') as f:
+        with h5py.File(self._file_path, 'r') as fh:
+            f = fh[self._group]
+            if 't' not in f or 'Samples' not in f:
+                raise ValueError(
+                    f"{self._file_path} holds several sample rates "
+                    f"({', '.join(f'{r:g}' for r in read(self._file_path).rates)}); "
+                    "read one with .stream(rate).read(...)")
             total_N = f['t'].shape[1]
             total_C = f['Samples'].shape[0]
 
@@ -378,7 +436,9 @@ class TEA:
 
             # Read Samples (HDF5 shape: (C, N) → transpose to (N, C))
             if channel_indices is not None:
-                Data = f['Samples'][channel_indices, s_start:s_end + 1].T
+                # h5py needs increasing, unique indices; reorder afterwards
+                uniq, inverse = np.unique(channel_indices, return_inverse=True)
+                Data = f['Samples'][uniq.tolist(), s_start:s_end + 1].T[:, inverse]
             else:
                 Data = f['Samples'][:, s_start:s_end + 1].T
 
@@ -391,6 +451,7 @@ class TEA:
         """Recompute all dependent variables from the full t vector."""
         if not os.path.isfile(self._file_path):
             raise FileNotFoundError(f"File not found: {self._file_path}")
+        self._refuse_v2_write()
 
         with h5py.File(self._file_path, 'r+') as f:
             t = f['t'][0, :]
@@ -415,10 +476,12 @@ class TEA:
             't_offset': self._t_offset,
             't_offset_units': self._t_offset_units,
             't_offset_scale': self._t_offset_scale,
+            'schema_version': self._schema_version,
         }
 
         if os.path.isfile(self._file_path):
-            with h5py.File(self._file_path, 'r') as f:
+            with h5py.File(self._file_path, 'r') as fh:
+                f = fh[self._group]
                 if 'isContinuous' in f:
                     result['isContinuous'] = bool(np.squeeze(f['isContinuous'][()]))
                 N = result['N']
@@ -894,3 +957,485 @@ class TEA:
                 stored = arr.T if arr.ndim > 1 else arr.reshape(1, -1)
                 ds = hdr_grp.create_dataset(key, data=stored)
                 ds.attrs['MATLAB_class'] = np.bytes_('double')
+
+
+# =====================================================================
+# Schema version 2: several sample rates in one file
+# =====================================================================
+
+
+def _schema_version_of(f: h5py.File) -> int:
+    """Schema version stored in an open file; 1 when the file has none."""
+    if 'schema_version' in f:
+        return int(round(float(np.squeeze(f['schema_version'][()]))))
+    return 1
+
+
+def _write_char_matrix(g: h5py.Group, name: str, strings: Sequence[str]) -> None:
+    """Write strings as a MATLAB char matrix, one row per string, space padded.
+
+    MATLAB reads it as a [len(strings) x max_len] char array; cellstr() gives
+    the cell array of names.
+    """
+    if name in g:
+        del g[name]
+    max_len = max([1] + [len(s) for s in strings])
+    arr = np.full((len(strings), max_len), ord(' '), dtype=np.uint16)
+    for i, s in enumerate(strings):
+        arr[i, :len(s)] = [ord(c) for c in s]
+    ds = g.create_dataset(name, data=arr.T)  # MATLAB [n, len] stored as HDF5 (len, n)
+    ds.attrs['MATLAB_class'] = np.bytes_('char')
+    ds.attrs['MATLAB_int_decode'] = np.int32(2)
+
+
+def _read_char_matrix(ds: h5py.Dataset) -> list[str] | None:
+    """Rows of a MATLAB char matrix, trailing spaces and NULs removed.
+
+    Returns None when the dataset is not a char array (e.g. a MATLAB cell).
+    """
+    data = ds[()]
+    if not np.issubdtype(np.asarray(data).dtype, np.integer):
+        return None
+    rows = np.atleast_2d(np.asarray(data)).T  # HDF5 (len, n) -> (n, len)
+    return [''.join(chr(c) for c in row).rstrip(' \x00') for row in rows]
+
+
+def _read_scalar(f: h5py.Group, name: str, default=None):
+    """A MATLAB scalar (or None when absent or stored empty)."""
+    if name not in f:
+        return default
+    ds = f[name]
+    if ds.attrs.get('MATLAB_empty', 0):
+        return default
+    return np.squeeze(ds[()]).item()
+
+
+def _read_string(f: h5py.Group, name: str, default: str = '') -> str:
+    if name not in f:
+        return default
+    rows = _read_char_matrix(f[name])
+    return ''.join(rows) if rows is not None else default
+
+
+def _find_rate(rates: Sequence[float | None], rate: float | None) -> int:
+    """Index of `rate` in `rates`; `rate=None` picks the only stream."""
+    if rate is None:
+        if len(rates) == 1:
+            return 0
+        raise ValueError(f"The file holds {len(rates)} streams; give a rate "
+                         f"({', '.join(f'{r:g}' for r in rates if r is not None)}).")
+    for i, r in enumerate(rates):
+        if r is not None and abs(r - rate) <= 1e-9 * max(1.0, abs(rate)):
+            return i
+    raise KeyError(f"No stream with rate {rate:g}; the file has "
+                   f"{', '.join(f'{r:g}' for r in rates if r is not None) or 'none'}.")
+
+
+@dataclass
+class Stream:
+    """One sample rate's data, as given to `write`.
+
+    Attributes:
+        rate: Sample rate in samples per t unit (Hz when t is in seconds).
+        channel_names: One name per column of `samples`.
+        units: One unit string per channel, or one string for all (e.g. 'uV').
+        samples: (n, ch) float64 array.
+        t: (n,) timestamps, strictly increasing, relative to t_offset. Gaps are
+            allowed: a step larger than 1.1 / rate starts a new segment.
+        is_regular: True when samples are evenly spaced within segments.
+    """
+    rate: float
+    channel_names: Sequence[str]
+    units: str | Sequence[str]
+    samples: npt.ArrayLike
+    t: npt.ArrayLike
+    is_regular: bool = True
+
+
+class TEAStream(TEA):
+    """Read-only view of one stream (one sample rate) of a TEA file.
+
+    Has the `TEA` read API (`read`, `N`, `C`, `ch_map`, `info`) plus `rate`,
+    `channel_names` and `units`. `read(channels=...)` accepts channel numbers
+    (1-based, or the file's ch_map) and channel names.
+    """
+
+    def __init__(self, file_path: str, group: str, rate: float | None,
+                 is_regular: bool, channel_names: list[str], units: list[str], *,
+                 schema_version: int, t_units: str = '',
+                 t_offset: int | float | None = None, t_offset_units: str = '',
+                 t_offset_scale: float = 1.0) -> None:
+        # Bound to an existing group; TEA.__init__'s new-file checks do not apply.
+        self._file_path = str(file_path)
+        self._group = group
+        self._schema_version = schema_version
+        self._SR = float(rate) if rate is not None else None
+        self._is_regular = bool(is_regular)
+        self.t_units = t_units
+        self._t_offset = t_offset
+        self._t_offset_units = t_offset_units
+        self._t_offset_scale = float(t_offset_scale)
+        self.hdr = {}
+        self.tea_version = ''
+        self._compress = False
+        self._expected_length = None
+        self._expected_channels = None
+        self._is_initialized = True
+        self._N_written = None
+        self._C_written = None
+        self._N_allocated = None
+        self._C_allocated = None
+        self._channel_names = list(channel_names)
+        self._units = list(units)
+
+    def __repr__(self) -> str:
+        return (f"TEAStream({self._file_path!r}, group={self._group!r}, "
+                f"rate={self._SR}, N={self.N}, C={self.C})")
+
+    @property
+    def rate(self) -> float | None:
+        """Sample rate of this stream."""
+        return self._SR
+
+    @property
+    def channel_names(self) -> list[str]:
+        return list(self._channel_names)
+
+    @property
+    def units(self) -> list[str]:
+        return list(self._units)
+
+    @property
+    def group(self) -> str:
+        """HDF5 group holding this stream's t and Samples."""
+        return self._group
+
+    def info(self) -> dict:
+        result = super().info()
+        result.update(rate=self._SR, channel_names=self.channel_names,
+                      units=self.units, group=self._group)
+        return result
+
+    def _resolve_channels(self, f, channels, total_C):
+        if channels is None:
+            return None
+        by_number = [c for c in channels if not isinstance(c, str)]
+        numbered = iter(super()._resolve_channels(f, by_number, total_C)
+                        if by_number else [])
+        indices = []
+        for c in channels:
+            if isinstance(c, str):
+                if c not in self._channel_names:
+                    raise ValueError(f"Channel {c!r} not found")
+                indices.append(self._channel_names.index(c))
+            else:
+                indices.append(next(numbered))
+        return np.array(indices, dtype=int)
+
+    def _read_only(self, *args, **kwargs):
+        raise RuntimeError("A TEAStream is read-only; write with tea.write() or tea.Writer.")
+
+    write = write_absolute = write_channels = finalize = refresh = _read_only
+
+
+class TEAFile:
+    """A TEA file of any schema version, opened for reading with `read(path)`.
+
+    Attributes:
+        file_path, schema_version, rates, channel_names (all streams, in
+        stream order), channel_rates (rate of each of those channels),
+        t_units, t_offset, t_offset_units, t_offset_scale.
+    """
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = str(file_path)
+        with h5py.File(self.file_path, 'r') as f:
+            self.schema_version = _schema_version_of(f)
+            if self.schema_version > SCHEMA_VERSION:
+                raise ValueError(
+                    f"{self.file_path} is TEA schema version {self.schema_version}; "
+                    f"this reader knows up to {SCHEMA_VERSION}.")
+            self.t_units = _read_string(f, 't_units')
+            self.t_offset = _read_scalar(f, 't_offset')
+            self.t_offset_units = _read_string(f, 't_offset_units')
+            self.t_offset_scale = float(_read_scalar(f, 't_offset_scale', 1.0))
+            self._streams = []
+            if self.schema_version >= 2:
+                groups = sorted(f[RATES_GROUP].keys(), key=lambda k: int(k[1:]))
+                for k in groups:
+                    g = f[RATES_GROUP][k]
+                    self._streams.append(self._make_stream(
+                        f'/{RATES_GROUP}/{k}', g,
+                        _read_char_matrix(g['channel_names']),
+                        _read_char_matrix(g['units'])))
+            elif 't' in f and 'Samples' in f:
+                C = f['Samples'].shape[0]
+                names = None
+                if 'hdr' in f and 'channel_names' in f['hdr']:
+                    names = _read_char_matrix(f['hdr']['channel_names'])
+                if names is None or len(names) != C:
+                    if 'ch_map' in f:
+                        ch_map = np.squeeze(f['ch_map'][()]).ravel()
+                    else:
+                        ch_map = np.arange(1, C + 1)
+                    names = [f'Ch{int(n)}' for n in ch_map]
+                self._streams.append(self._make_stream('/', f, names, [''] * C))
+
+    def _make_stream(self, group: str, g: h5py.Group, names, units) -> TEAStream:
+        return TEAStream(
+            self.file_path, group, _read_scalar(g, 'SR'),
+            bool(_read_scalar(g, 'isRegular', True)), names, units,
+            schema_version=self.schema_version, t_units=self.t_units,
+            t_offset=self.t_offset, t_offset_units=self.t_offset_units,
+            t_offset_scale=self.t_offset_scale)
+
+    def __repr__(self) -> str:
+        return (f"TEAFile({self.file_path!r}, schema_version={self.schema_version}, "
+                f"rates={self.rates})")
+
+    @property
+    def rates(self) -> list[float]:
+        """Sample rate of each stream, in file order."""
+        return [s.rate for s in self._streams]
+
+    @property
+    def streams(self) -> list[TEAStream]:
+        return list(self._streams)
+
+    @property
+    def channel_names(self) -> list[str]:
+        return [n for s in self._streams for n in s.channel_names]
+
+    @property
+    def channel_rates(self) -> list[float]:
+        return [s.rate for s in self._streams for _ in s.channel_names]
+
+    def stream(self, rate: float | None = None) -> TEAStream:
+        """The stream with this sample rate (`rate` may be omitted for one stream)."""
+        return self._streams[_find_rate(self.rates, rate)]
+
+
+def read(file_path: str | os.PathLike) -> TEAFile:
+    """Open a TEA file of schema version 1 or 2 for reading.
+
+    Example:
+        f = tea.read('clip.mat')
+        f.rates                                   # [256.0, 1024.0]
+        data, t, disc = f.stream(1024).read(t_range=(10.0, 12.0))
+    """
+    return TEAFile(os.fspath(file_path))
+
+
+class _StreamState:
+    """Writer bookkeeping for one stream."""
+
+    def __init__(self, rate: float, is_regular: bool, names: list[str],
+                 units: list[str], group: h5py.Group) -> None:
+        self.rate = rate
+        self.is_regular = is_regular
+        self.names = names
+        self.units = units
+        self.g = group
+        self.n = 0
+        self.t_last: float | None = None
+        self.disc: list[tuple[int, int]] = []  # 1-indexed [last_before, first_after]
+        self.df = max(1, round(rate)) if is_regular else 1
+        self.t_coarse: list[np.ndarray] = []
+
+
+class Writer:
+    """Write a TEA schema-version-2 file, appending to each stream in pieces.
+
+    Example:
+        with tea.Writer('clip.mat', t_offset=1770000000, compress=True) as w:
+            w.add_stream(256, ['Fp1', 'Fp2'], 'uV')
+            w.add_stream(1024, ['DC1'], 'mV')
+            for t, x in blocks_256:  w.append(256, t, x)
+            for t, x in blocks_1024: w.append(1024, t, x)
+
+    Each stream lives in its own group `/rates/r<k>` (k = 1, 2, ... in the
+    order streams are added) with the version-1 layout: `t`, `Samples`, `SR`,
+    `isRegular`, `t_coarse`, `df_t_coarse`, `isContinuous`, `cont`, `disc`,
+    plus `channel_names` and `units`. The file is finished by `close()` (or
+    leaving the `with` block); a file with one stream then also gets the
+    version-1 fields at the top level.
+    """
+
+    def __init__(self, file_path: str | os.PathLike, *,
+                 t_offset: int | float | None = None, t_offset_units: str = 'posix_s',
+                 t_offset_scale: float = 1.0, t_units: str = 's',
+                 hdr: dict | None = None, compress: bool = False) -> None:
+        self.file_path = os.fspath(file_path)
+        self._t_offset = t_offset
+        self._t_offset_units = t_offset_units
+        self._t_offset_scale = float(t_offset_scale)
+        self._t_units = t_units
+        self._hdr = hdr or {}
+        self._comp = {'compression': 'gzip', 'compression_opts': 1} if compress else {}
+        self._streams: list[_StreamState] = []
+        self._f: h5py.File | None = h5py.File(self.file_path, 'w', userblock_size=512)
+        rates = self._f.create_group(RATES_GROUP)
+        rates.attrs['MATLAB_class'] = np.bytes_('struct')
+        TEA._write_h5_scalar(self._f, 'schema_version', float(SCHEMA_VERSION))
+
+    def __enter__(self) -> 'Writer':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.close()
+        elif self._f is not None:
+            self._f.close()
+            self._f = None
+
+    @property
+    def rates(self) -> list[float]:
+        return [s.rate for s in self._streams]
+
+    def add_stream(self, rate: float, channel_names: Sequence[str],
+                   units: str | Sequence[str], *, is_regular: bool = True) -> None:
+        """Declare a stream; its data follows through `append(rate, t, samples)`."""
+        if self._f is None:
+            raise RuntimeError("Writer is closed")
+        rate = float(rate)
+        if not rate > 0:
+            raise ValueError("rate must be positive")
+        if any(abs(r - rate) <= 1e-9 * max(1.0, rate) for r in self.rates):
+            raise ValueError(f"A stream with rate {rate:g} already exists")
+        names = [str(n) for n in channel_names]
+        if not names:
+            raise ValueError("A stream needs at least one channel")
+        unit_list = [units] * len(names) if isinstance(units, str) else [str(u) for u in units]
+        if len(unit_list) != len(names):
+            raise ValueError(f"{len(unit_list)} units for {len(names)} channels")
+
+        C = len(names)
+        g = self._f[RATES_GROUP].create_group(f'r{len(self._streams) + 1}')
+        g.attrs['MATLAB_class'] = np.bytes_('struct')
+        ds_t = g.create_dataset('t', shape=(1, 0), maxshape=(1, None),
+                                chunks=(1, CHUNK_SAMPLES), dtype=np.float64, **self._comp)
+        ds_t.attrs['MATLAB_class'] = np.bytes_('double')
+        ds_s = g.create_dataset('Samples', shape=(C, 0), maxshape=(C, None),
+                                chunks=(C, CHUNK_SAMPLES), dtype=np.float64, **self._comp)
+        ds_s.attrs['MATLAB_class'] = np.bytes_('double')
+        TEA._write_h5_scalar(g, 'SR', rate)
+        TEA._write_h5_scalar(g, 'isRegular', is_regular, logical=True)
+        _write_char_matrix(g, 'channel_names', names)
+        _write_char_matrix(g, 'units', unit_list)
+        self._streams.append(_StreamState(rate, bool(is_regular), names, unit_list, g))
+
+    def append(self, rate: float, t: npt.ArrayLike, samples: npt.ArrayLike) -> None:
+        """Append samples (n, ch) with timestamps t (n,) to the stream of this rate."""
+        if self._f is None:
+            raise RuntimeError("Writer is closed")
+        st = self._streams[_find_rate(self.rates, float(rate))]
+        t = np.asarray(t, dtype=np.float64).ravel()
+        samples = np.asarray(samples, dtype=np.float64)
+        if samples.ndim == 1 and len(st.names) == 1:
+            samples = samples.reshape(-1, 1)
+        n = len(t)
+        if n == 0:
+            return
+        if samples.shape != (n, len(st.names)):
+            raise ValueError(f"samples has shape {samples.shape}; expected ({n}, {len(st.names)})")
+        tt = t if st.t_last is None else np.concatenate([[st.t_last], t])
+        dt = np.diff(tt)
+        if np.any(dt <= 0):
+            raise ValueError("t must be strictly increasing (and start after the previous append)")
+        if st.is_regular:
+            if np.any(dt < 0.9 / st.rate):
+                raise ValueError(f"Samples closer than 0.9 / rate in a stream marked regular "
+                                 f"(rate {st.rate:g})")
+            base = st.n - 1 if st.t_last is not None else 0  # global 0-based index of tt[0]
+            for j in np.flatnonzero(dt > 1.1 / st.rate):
+                st.disc.append((base + j + 1, base + j + 2))
+            first = -(-st.n // st.df) * st.df  # first coarse index >= st.n
+            st.t_coarse.append(t[np.arange(first - st.n, n, st.df)])
+
+        n_total = st.n + n
+        st.g['t'].resize((1, n_total))
+        st.g['Samples'].resize((len(st.names), n_total))
+        st.g['t'][0, st.n:n_total] = t
+        st.g['Samples'][:, st.n:n_total] = samples.T
+        st.n = n_total
+        st.t_last = float(t[-1])
+
+    def close(self) -> None:
+        """Write the dependent variables and top-level fields, and close the file."""
+        if self._f is None:
+            return
+        f = self._f
+        try:
+            if not self._streams:
+                raise ValueError("A TEA file needs at least one stream")
+            for st in self._streams:
+                if st.n == 0:
+                    raise ValueError(f"Stream {st.rate:g} has no samples")
+                self._write_stream_dependents(st)
+
+            TEA._write_h5_string(f, 'tea_version', '2.0')
+            if self._t_units:
+                TEA._write_h5_string(f, 't_units', self._t_units)
+            if self._t_offset is not None:
+                TEA._write_h5_scalar(f, 't_offset', self._t_offset)
+                TEA._write_h5_string(f, 't_offset_units', self._t_offset_units)
+                TEA._write_h5_scalar(f, 't_offset_scale', self._t_offset_scale)
+            all_names = [n for st in self._streams for n in st.names]
+            _write_char_matrix(f, 'channel_names', all_names)
+            TEA._write_h5_array(f, 'channel_rates',
+                                np.array([[st.rate for st in self._streams for _ in st.names]]).T)
+            if self._hdr:
+                TEA._write_hdr_fields(f, self._hdr)
+
+            if len(self._streams) == 1:
+                # Version-1 readers look for these at the top level: hard links,
+                # so the data is stored once.
+                g = self._streams[0].g
+                for name in _V1_LINKED:
+                    if name in g:
+                        f[name] = g[name]
+        finally:
+            f.close()
+            self._f = None
+        TEA._write_matlab_header(self.file_path)
+
+    @staticmethod
+    def _write_stream_dependents(st: _StreamState) -> None:
+        g = st.g
+        if st.is_regular:
+            df = st.df
+            t_coarse = np.concatenate(st.t_coarse)
+        else:
+            t = g['t'][0, :]
+            span = t[-1] - t[0]
+            df = max(1, round(st.n / span)) if span > 0 else 1
+            t_coarse = t[::df]
+        TEA._write_h5_array(g, 't_coarse', t_coarse.reshape(-1, 1))  # MATLAB [M, 1]
+        TEA._write_h5_scalar(g, 'df_t_coarse', float(df))
+        if st.disc:
+            disc = np.array(st.disc, dtype=np.float64)
+            cont = np.column_stack([np.concatenate([[1], disc[:, 1]]),
+                                    np.concatenate([disc[:, 0], [st.n]])])
+            TEA._write_h5_array(g, 'disc', disc)  # MATLAB [n, 2]
+            TEA._write_h5_array(g, 'cont', cont)
+        TEA._write_h5_scalar(g, 'isContinuous', not st.disc, logical=True)
+
+
+def write(file_path: str | os.PathLike, streams: Sequence[Stream], *,
+          t_offset: int | float | None = None, t_offset_units: str = 'posix_s',
+          t_offset_scale: float = 1.0, t_units: str = 's',
+          hdr: dict | None = None, compress: bool = False) -> None:
+    """Write streams (one per sample rate) to a TEA schema-version-2 file.
+
+    Example:
+        tea.write('clip.mat', [
+            tea.Stream(256, ['Fp1', 'Fp2'], 'uV', x256, t256),
+            tea.Stream(1024, ['DC1'], 'mV', x1024, t1024),
+        ], t_offset=1770000000, compress=True)
+    """
+    with Writer(file_path, t_offset=t_offset, t_offset_units=t_offset_units,
+                t_offset_scale=t_offset_scale, t_units=t_units, hdr=hdr,
+                compress=compress) as w:
+        for s in streams:
+            w.add_stream(s.rate, s.channel_names, s.units, is_regular=s.is_regular)
+            w.append(s.rate, s.t, s.samples)

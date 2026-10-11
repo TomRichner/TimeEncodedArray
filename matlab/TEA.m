@@ -18,6 +18,13 @@ classdef TEA < handle
 %       [D,t,disc] = read(channels, t_range, s_range) — Read data
 %       refresh()                   — Recompute dependent variables
 %       s = info()                  — Return file metadata summary
+%       st = stream(rate)           — Read-only TEAStream of one sample rate
+%
+%   Schema version 2 files hold several sample rates, one group per rate
+%   under /rates (written by the Python tea.write / tea.Writer). Open one with
+%   TEA(file, any_rate_in_file, true); tea.rates lists the rates and
+%   tea.stream(rate).read(...) reads one. A version-2 file with one rate also
+%   carries the version-1 fields, so read() works on it as on version 1.
 %
 %   Example:
 %       tea = TEA('data.mat', 1000, true, 't_units', 's');
@@ -25,7 +32,7 @@ classdef TEA < handle
 %       tea.write(t2, s2);       % appends
 %       [D, t] = tea.read([1 3], [1.0, 2.0], []);
 %
-%   Single-file implementation — no external dependencies required.
+%   No external dependencies; stream() uses TEAStream.m in the same folder.
 
     properties (SetAccess = immutable)
         file_path   char        % Path to the HDF5/.mat file
@@ -57,6 +64,8 @@ classdef TEA < handle
         N           % Total sample count (read from file)
         C           % Channel count (read from file)
         ch_map      % Channel identity vector
+        rates       % Sample rates of the streams in the file (schema version 2: one per group)
+        schema_version % 1 for a version-1 or new file, 2 for a version-2 file
     end
 
     methods
@@ -176,6 +185,51 @@ classdef TEA < handle
             end
         end
 
+        function val = get.schema_version(obj)
+            if exist(obj.file_path, 'file') ~= 2
+                val = 1;
+            else
+                val = TEAStream.schema_version_of(obj.file_path);
+            end
+        end
+
+        function val = get.rates(obj)
+            if exist(obj.file_path, 'file') ~= 2
+                val = [];
+                return;
+            end
+            streams = TEAStream.open_all(obj.file_path);
+            val = zeros(1, numel(streams));
+            for k = 1:numel(streams)
+                if isempty(streams(k).rate), val(k) = NaN; else, val(k) = streams(k).rate; end
+            end
+        end
+
+        %% ============ STREAM ============
+        function st = stream(obj, rate)
+        % STREAM Read-only view (TEAStream) of the stream with this sample rate.
+        %
+        %   st = tea.stream(rate)
+        %   st = tea.stream()        % when the file holds one stream
+        %   [Data, t, disc_info] = st.read(channels, t_range, s_range);
+            streams = TEAStream.open_all(obj.file_path);
+            if nargin < 2 || isempty(rate)
+                if numel(streams) ~= 1
+                    error('TEA:RateRequired', 'The file holds %d streams; give a rate.', numel(streams));
+                end
+                st = streams(1);
+                return;
+            end
+            for k = 1:numel(streams)
+                r = streams(k).rate;
+                if ~isempty(r) && abs(r - rate) <= 1e-9 * max(1, abs(rate))
+                    st = streams(k);
+                    return;
+                end
+            end
+            error('TEA:RateNotFound', 'No stream with rate %g; the file has %s.', rate, mat2str(obj.rates));
+        end
+
         %% ============ INIT ============
         function init(obj, n_samples, n_channels, data_class)
         % INIT Pre-allocate the HDF5 file with chunked datasets.
@@ -216,6 +270,7 @@ classdef TEA < handle
         %   On subsequent writes, appends in time.
 
             % --- Validate inputs ---
+            obj.refuse_v2_write();
             obj.validate_t(t);
             N_new = length(t);
             if size(Samples, 1) ~= N_new
@@ -347,6 +402,7 @@ classdef TEA < handle
             if ~obj.is_initialized
                 error('TEA:NotInitialized', 'Cannot append channels before any data has been written.');
             end
+            obj.refuse_v2_write();
 
             if nargin < 3, new_ch_map = []; end
 
@@ -478,6 +534,11 @@ classdef TEA < handle
             file_vars = whos(mf);
             var_names = {file_vars.name};
 
+            if ~ismember('t', var_names) && ismember('rates', var_names)
+                error('TEA:MultiRate', ...
+                    '%s holds several sample rates (%s); read one with stream(rate).read(...).', ...
+                    obj.file_path, mat2str(obj.rates));
+            end
             if ~ismember(data_var_name, var_names)
                 error('TEA:VarNotFound', 'Variable "%s" not found.', data_var_name);
             end
@@ -538,6 +599,7 @@ classdef TEA < handle
             if ~exist(obj.file_path, 'file')
                 error('TEA:FileNotFound', 'File not found: %s', obj.file_path);
             end
+            obj.refuse_v2_write();
 
             mf = matfile(obj.file_path, 'Writable', true);
             t = mf.t(:, 1);
@@ -585,6 +647,14 @@ classdef TEA < handle
 
     %% ============ PRIVATE METHODS ============
     methods (Access = private)
+
+        function refuse_v2_write(obj)
+            if exist(obj.file_path, 'file') == 2 && obj.schema_version >= 2
+                error('TEA:Version2File', ...
+                    '%s is a TEA version-%d file; write it with the Python tea.write / tea.Writer.', ...
+                    obj.file_path, obj.schema_version);
+            end
+        end
 
         function validate_t(~, t)
             if isempty(t)

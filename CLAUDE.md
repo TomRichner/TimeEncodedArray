@@ -15,7 +15,9 @@ tea = TEA('file.mat', SR, isRegular, 't_units','s', 'expected_length', N, 'compr
 tea.write(t, Samples);              % append
 tea.finalize();                     % trim preallocated datasets
 [data, t, info] = tea.read(channels, t_range, s_range);
-runtests('test_tea')                % 24 tests
+runtests('test_tea')                % 37 tests
+runtests('test_tea_v2')             % 6 tests (schema v2; reads files from python/tests/write_v2_test_cases.py)
+s = tea.stream(rate); s.read(...)   % schema v2: one TEAStream per sample rate
 ```
 
 **Python:**
@@ -25,7 +27,10 @@ tea = TEA('file.mat', SR, is_regular=True, ...)
 tea.write(t, samples)
 tea.finalize()
 data, t, info = tea.read(channels=..., t_range=..., s_range=...)
-# Tests: python -m pytest python/tests/test_tea.py -v   (25 tests)
+# Schema v2 (several rates per file):
+tea.write(path, [tea.Stream(rate, names, units, samples, t), ...], t_offset=...)  # or tea.Writer
+f = tea.read(path); f.rates; f.stream(rate).read(...)
+# Tests: uv run pytest -q   (54 tests: test_tea.py 39, test_tea_v2.py 15)
 # Install: pip install -e .         (from repo root, uses pyproject.toml)
 ```
 
@@ -33,13 +38,13 @@ Cross-validation: run `write_test_cases` in one language, `compare_test_cases` i
 
 ## Directory Layout
 
-- `matlab/TEA.m` — class (~1000 lines).
-- `matlab/tests/test_tea.m`, `write_test_cases.m`, `compare_test_cases.m`.
+- `matlab/TEA.m` — class (~1000 lines); `matlab/TEAStream.m` — read-only view of one rate (schema v2).
+- `matlab/tests/test_tea.m`, `test_tea_v2.m`, `write_test_cases.m`, `compare_test_cases.m`.
 - `matlab/examples/example_brew_and_drink.m`.
 - `python/tea.py` — module (~880 lines).
-- `python/tests/test_tea.py`, `write_test_cases.py`, `compare_test_cases.py`.
+- `python/tests/test_tea.py`, `test_tea_v2.py`, `write_test_cases.py`, `compare_test_cases.py`, `write_v2_test_cases.py`.
 - `python/examples/example_tea.py`.
-- `schema/tea_schema.md` — full file-format specification (schema version `1.0`).
+- `schema/tea_schema.md` — full file-format specification (schema versions 1 and 2; v2 = one group per rate under `/rates`, one-rate v2 files also carry the v1 fields as hard links).
 - `cross_validation_data/` — artifacts from cross-language tests.
 - `pyproject.toml`, `LICENSE` (MIT), `README.md`.
 
