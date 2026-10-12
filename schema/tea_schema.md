@@ -68,6 +68,8 @@ diff(t(k)) > 1.1 / SR
 
 where `1/SR` is the expected time step (in the same units as `t`).
 
+Within a continuous segment every step satisfies `0.9 / SR <= diff(t) <= 1.1 / SR`; a larger step is a discontinuity and a smaller one is an error (writers refuse it).
+
 When discontinuities are present (`isContinuous = false`):
 
 - **`cont`**: An `[n_cont × 2]` matrix. Each row `[start_idx, stop_idx]` defines a contiguous block of samples. The union of all blocks covers all N samples.

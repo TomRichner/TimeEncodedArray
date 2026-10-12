@@ -10,15 +10,14 @@ Two layers:
   file, one group per rate under `/rates`. A version-2 file with one rate also
   carries the version-1 fields, so `TEA` and version-1 readers open it as before.
 
-Uses h5py for all HDF5 operations. The MATLAB v7.3 userblock header
-is written directly as raw bytes.
+Uses h5py for all HDF5 operations; the MATLAB-side helpers (datasets with
+`MATLAB_class` attributes, the v7.3 userblock header) live in `tea_h5`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import time
 import warnings
 from dataclasses import dataclass
 from typing import Sequence
@@ -26,6 +25,10 @@ from typing import Sequence
 import h5py
 import numpy as np
 import numpy.typing as npt
+
+from tea_h5 import (read_char_matrix, read_scalar, read_string, schema_version_of,
+                    write_array, write_char_matrix, write_hdr_fields,
+                    write_matlab_header, write_scalar, write_string)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ def chunk_samples(n_channels: int, dtype=np.float64, target_bytes: int = CHUNK_B
     per_sample = max(1, int(n_channels)) * itemsize
     return int(min(CHUNK_SAMPLES_MAX, max(CHUNK_SAMPLES_MIN, target_bytes // per_sample)))
 
+
 # Highest schema version this module writes and reads.
 SCHEMA_VERSION = 2
 
@@ -67,6 +71,228 @@ RATES_GROUP = 'rates'
 # top level, so version-1 readers find them where they expect them.
 _V1_LINKED = ('t', 'Samples', 'SR', 'isRegular', 't_coarse', 'df_t_coarse',
               'isContinuous', 'cont', 'disc')
+
+# Regularity: within a continuous segment 0.9/SR <= dt <= 1.1/SR; a larger
+# step is a gap (discontinuity), a smaller one is an error.
+GAP_FACTOR = 1.1
+MIN_DT_FACTOR = 0.9
+
+
+# =====================================================================
+# Shared pieces: dependents, sample reads
+# =====================================================================
+
+
+def dependents(t: np.ndarray, rate: float | None, is_regular: bool
+               ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, bool]:
+    """The dependent variables of a stream from its full t vector.
+
+    Returns `(t_coarse, df, disc, cont, is_cont)`: the coarse index and its
+    decimation factor, the gap and segment tables as MATLAB sees them
+    (1-indexed `[n, 2]`, empty when continuous) and the continuity flag. A gap
+    is a step `> GAP_FACTOR / rate`; irregular streams are continuous by
+    convention.
+    """
+    N = len(t)
+    if is_regular and rate is not None and rate > 0:
+        df = max(1, round(rate))
+    else:
+        span = (t[-1] - t[0]) if N > 0 else 0.0
+        df = max(1, round(N / span)) if span > 0 else 1
+    t_coarse = t[::df] if N > 0 else np.array([])
+
+    disc = np.zeros((0, 2))
+    cont = np.zeros((0, 2))
+    is_cont = True
+    if is_regular and rate is not None and rate > 0 and N > 1:
+        gap_idx = np.flatnonzero(np.diff(t) > GAP_FACTOR / rate)  # 0-indexed
+        if gap_idx.size:
+            is_cont = False
+            # 1-indexed [last_before, first_after] for MATLAB
+            disc = np.column_stack([gap_idx + 1, gap_idx + 2]).astype(np.float64)
+            cont = np.column_stack([np.concatenate([[1], gap_idx + 2]),
+                                    np.concatenate([gap_idx + 1, [N]])]).astype(np.float64)
+    return t_coarse, int(df), disc, cont, is_cont
+
+
+def _write_dependent_datasets(g: h5py.Group, t_coarse: np.ndarray, df: int,
+                              disc: np.ndarray, cont: np.ndarray, is_cont: bool) -> None:
+    """Store the dependents in a stream group (`cont`/`disc` only when there are gaps)."""
+    tc = t_coarse.reshape(-1, 1) if len(t_coarse) > 0 else np.zeros((0, 1))
+    write_array(g, 't_coarse', tc)  # MATLAB [M, 1]
+    write_scalar(g, 'df_t_coarse', float(df))
+    if is_cont:
+        for var in ('disc', 'cont'):
+            if var in g:
+                del g[var]
+    else:
+        write_array(g, 'disc', disc)  # MATLAB [n, 2]
+        write_array(g, 'cont', cont)
+    write_scalar(g, 'isContinuous', is_cont, logical=True)
+
+
+def _resolve_channels(g: h5py.Group, channels, total_C: int,
+                      names: Sequence[str] | None = None) -> np.ndarray | None:
+    """Column indices of `channels`: numbers through `ch_map`, names through `names`."""
+    if channels is None:
+        return None
+    if 'ch_map' in g:
+        file_ch_map = np.squeeze(g['ch_map'][()]).ravel()
+    else:
+        file_ch_map = np.arange(1, total_C + 1)
+    indices = []
+    for ch in channels:
+        if isinstance(ch, str):
+            if names is None or ch not in names:
+                raise ValueError(f"Channel {ch!r} not found")
+            indices.append(list(names).index(ch))
+        else:
+            found = np.where(file_ch_map == ch)[0]
+            if len(found) == 0:
+                raise ValueError(f"Channel {ch} not found in ch_map")
+            indices.append(int(found[0]))
+    return np.array(indices, dtype=int)
+
+
+def _find_range_from_time(g: h5py.Group, t_range: tuple[float, float],
+                          total_N: int) -> tuple[int, int]:
+    """Inclusive 0-based sample range covering `t_range`, using `t_coarse` when present."""
+    if total_N == 0:
+        return 0, -1
+
+    t_start_req, t_end_req = t_range
+    t_first = float(g['t'][0, 0])
+    t_last = float(g['t'][0, total_N - 1])
+
+    if t_start_req > t_last or t_end_req < t_first:
+        return 0, -1  # out of range
+
+    t_start = max(t_start_req, t_first)
+    t_end = min(t_end_req, t_last)
+
+    has_tc = 't_coarse' in g and 'df_t_coarse' in g
+    if not has_tc:
+        # Full t load fallback
+        full_t = g['t'][0, :]
+        s_start = int(np.searchsorted(full_t, t_start, side='left'))
+        s_end = int(np.searchsorted(full_t, t_end, side='right') - 1)
+        return s_start, s_end
+
+    # Use t_coarse for fast lookup
+    tc = g['t_coarse'][()].ravel()
+    df = int(np.squeeze(g['df_t_coarse'][()]))
+
+    # Find start
+    if t_start <= t_first:
+        s_start = 0
+    else:
+        d_idx = np.searchsorted(tc, t_start, side='left')
+        ws = max(0, (d_idx - 1) * df)
+        we = min((d_idx + 1) * df, total_N)
+        tw = g['t'][0, ws:we]
+        ri = np.searchsorted(tw, t_start, side='left')
+        s_start = ws + ri
+
+    # Find end
+    if t_end >= t_last:
+        s_end = total_N - 1
+    else:
+        d_idx = np.searchsorted(tc, t_end, side='right')
+        ws = max(0, (d_idx - 1) * df)
+        we = min((d_idx + 1) * df, total_N)
+        tw = g['t'][0, ws:we]
+        ri = np.searchsorted(tw, t_end, side='right') - 1
+        s_end = ws + max(0, ri)
+
+    s_start = max(0, min(s_start, total_N - 1))
+    s_end = max(0, min(s_end, total_N - 1))
+    return int(s_start), int(s_end)
+
+
+def _compute_disc_info(t_out: np.ndarray, rate: float | None, is_regular: bool) -> dict:
+    """Gap table of a read window (0-based indices into `t_out`)."""
+    NN = len(t_out)
+    result = {'is_discontinuous': False,
+              'cont': np.zeros((0, 2)),
+              'disc': np.zeros((0, 2))}
+
+    if NN < 2 or not is_regular or rate is None or rate <= 0:
+        if NN > 0:
+            result['cont'] = np.array([[0, NN - 1]])
+        return result
+
+    gi = np.flatnonzero(np.diff(t_out) > GAP_FACTOR / rate)
+    if gi.size:
+        result['is_discontinuous'] = True
+        result['disc'] = np.column_stack([gi, gi + 1])
+        starts = np.concatenate([[0], gi + 1])
+        ends = np.concatenate([gi, [NN - 1]])
+        result['cont'] = np.column_stack([starts, ends])
+    else:
+        result['cont'] = np.array([[0, NN - 1]])
+    return result
+
+
+def _read_samples(g: h5py.Group, rate: float | None, is_regular: bool,
+                  channels=None, t_range: tuple[float, float] | None = None,
+                  s_range: tuple[int, int] | None = None,
+                  channel_names: Sequence[str] | None = None,
+                  ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Read `(Data, t_out, disc_info)` from a stream group (`t` and `Samples`).
+
+    `channels` are numbers (through `ch_map`) or, when `channel_names` is
+    given, names; `t_range` and `s_range` (0-based inclusive) are exclusive.
+    """
+    if t_range is not None and s_range is not None:
+        raise ValueError("Specify either t_range or s_range, not both.")
+    total_N = g['t'].shape[1]
+    total_C = g['Samples'].shape[0]
+
+    channel_indices = _resolve_channels(g, channels, total_C, channel_names)
+
+    if s_range is not None:
+        s_start, s_end = int(s_range[0]), int(s_range[1])
+        if s_start < 0 or s_end >= total_N or s_start > s_end:
+            raise ValueError(
+                f"Invalid s_range [{s_start}, {s_end}]. Valid: [0, {total_N - 1}]")
+    elif t_range is not None:
+        s_start, s_end = _find_range_from_time(g, t_range, total_N)
+    else:
+        s_start, s_end = 0, total_N - 1
+
+    n_ch = len(channel_indices) if channel_indices is not None else total_C
+    if total_N == 0 or s_start > s_end or s_start < 0:
+        empty_disc = {'is_discontinuous': False,
+                      'cont': np.zeros((0, 2)), 'disc': np.zeros((0, 2))}
+        return np.zeros((0, n_ch)), np.zeros(0), empty_disc
+
+    t_out = g['t'][0, s_start:s_end + 1]
+
+    # Samples is HDF5 (C, N); transpose to (N, C)
+    if channel_indices is not None:
+        # h5py needs increasing, unique indices; reorder afterwards
+        uniq, inverse = np.unique(channel_indices, return_inverse=True)
+        data = g['Samples'][uniq.tolist(), s_start:s_end + 1].T[:, inverse]
+    else:
+        data = g['Samples'][:, s_start:s_end + 1].T
+
+    return data, t_out, _compute_disc_info(t_out, rate, is_regular)
+
+
+def _stream_info(g: h5py.Group, N: int) -> dict:
+    """`isContinuous`, `t_first`, `t_last` of a stream group, when present."""
+    result = {}
+    if 'isContinuous' in g:
+        result['isContinuous'] = bool(np.squeeze(g['isContinuous'][()]))
+    if N > 0:
+        result['t_first'] = float(g['t'][0, 0])
+        result['t_last'] = float(g['t'][0, N - 1])
+    return result
+
+
+# =====================================================================
+# Schema version 1: one sample rate per file
+# =====================================================================
 
 
 class TEA:
@@ -120,9 +346,6 @@ class TEA:
         self._expected_length = int(expected_length) if expected_length is not None else None
         self._expected_channels = int(expected_channels) if expected_channels is not None else None
         self._is_initialized = False
-        # HDF5 group holding t/Samples: '/' for this class; a rate group for
-        # the read-only TEAStream views of a version-2 file.
-        self._group = '/'
         self._schema_version = 1
 
         # Pre-allocation tracking (logical vs physical sizes)
@@ -159,7 +382,7 @@ class TEA:
                         raise ValueError(
                             f"isRegular mismatch: file has {file_ir} but constructor says {is_regular}")
                 self._is_initialized = ('t' in f and 'Samples' in f)
-                self._schema_version = _schema_version_of(f)
+                self._schema_version = schema_version_of(f)
 
     # ============ Properties ============
 
@@ -205,7 +428,7 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            return f[self._group]['t'].shape[1]
+            return f['t'].shape[1]
 
     @property
     def C(self) -> int:
@@ -215,7 +438,7 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return 0
         with h5py.File(self._file_path, 'r') as f:
-            return f[self._group]['Samples'].shape[0]
+            return f['Samples'].shape[0]
 
     @property
     def ch_map(self) -> ArrayFloat64:
@@ -223,11 +446,9 @@ class TEA:
         if not os.path.isfile(self._file_path) or not self._is_initialized:
             return np.array([], dtype=np.float64)
         with h5py.File(self._file_path, 'r') as f:
-            g = f[self._group]
-            if 'ch_map' in g:
-                return np.squeeze(g['ch_map'][()]).ravel().astype(np.float64)
-            else:
-                return np.arange(1, self.C + 1, dtype=np.float64)
+            if 'ch_map' in f:
+                return np.squeeze(f['ch_map'][()]).ravel().astype(np.float64)
+            return np.arange(1, self.C + 1, dtype=np.float64)
 
     def _refuse_v2_write(self) -> None:
         if self._schema_version >= 2:
@@ -354,7 +575,7 @@ class TEA:
             else:
                 new_map = np.concatenate([old_map, np.arange(C_old + 1, C_total + 1, dtype=np.float64)])
 
-            self._write_h5_array(f, 'ch_map', new_map.reshape(1, -1))  # MATLAB [1, C]
+            write_array(f, 'ch_map', new_map.reshape(1, -1))  # MATLAB [1, C]
 
         self._C_written = C_total
         logger.info("TEA channels appended: %s (now %d channels)",
@@ -419,50 +640,13 @@ class TEA:
         if t_range is not None and s_range is not None:
             raise ValueError("Specify either t_range or s_range, not both.")
 
-        with h5py.File(self._file_path, 'r') as fh:
-            f = fh[self._group]
+        with h5py.File(self._file_path, 'r') as f:
             if 't' not in f or 'Samples' not in f:
                 raise ValueError(
                     f"{self._file_path} holds several sample rates "
                     f"({', '.join(f'{r:g}' for r in read(self._file_path).rates)}); "
                     "read one with .stream(rate).read(...)")
-            total_N = f['t'].shape[1]
-            total_C = f['Samples'].shape[0]
-
-            # Channel selection
-            channel_indices = self._resolve_channels(f, channels, total_C)
-
-            # Determine sample range
-            if s_range is not None:
-                s_start, s_end = int(s_range[0]), int(s_range[1])
-                if s_start < 0 or s_end >= total_N or s_start > s_end:
-                    raise ValueError(
-                        f"Invalid s_range [{s_start}, {s_end}]. Valid: [0, {total_N - 1}]")
-            elif t_range is not None:
-                s_start, s_end = self._find_range_from_time(f, t_range, total_N)
-            else:
-                s_start, s_end = 0, total_N - 1
-
-            # Empty result
-            n_ch = len(channel_indices) if channel_indices is not None else total_C
-            if total_N == 0 or s_start > s_end or s_start < 0:
-                empty_disc = {'is_discontinuous': False,
-                              'cont': np.zeros((0, 2)), 'disc': np.zeros((0, 2))}
-                return np.zeros((0, n_ch)), np.zeros(0), empty_disc
-
-            # Read t
-            t_out = f['t'][0, s_start:s_end + 1]
-
-            # Read Samples (HDF5 shape: (C, N) → transpose to (N, C))
-            if channel_indices is not None:
-                # h5py needs increasing, unique indices; reorder afterwards
-                uniq, inverse = np.unique(channel_indices, return_inverse=True)
-                Data = f['Samples'][uniq.tolist(), s_start:s_end + 1].T[:, inverse]
-            else:
-                Data = f['Samples'][:, s_start:s_end + 1].T
-
-            disc_info = self._compute_disc_info(t_out)
-            return Data, t_out, disc_info
+            return _read_samples(f, self._SR, self._is_regular, channels, t_range, s_range)
 
     # ============ Refresh ============
 
@@ -476,7 +660,7 @@ class TEA:
             t = f['t'][0, :]
             self._write_dependents(f, t)
             if 'tea_version' not in f:
-                self._write_h5_string(f, 'tea_version', '1.0')
+                write_string(f, 'tea_version', '1.0')
 
         logger.info("TEA refreshed: %s", self._file_path)
 
@@ -497,17 +681,9 @@ class TEA:
             't_offset_scale': self._t_offset_scale,
             'schema_version': self._schema_version,
         }
-
-        if os.path.isfile(self._file_path):
-            with h5py.File(self._file_path, 'r') as fh:
-                f = fh[self._group]
-                if 'isContinuous' in f:
-                    result['isContinuous'] = bool(np.squeeze(f['isContinuous'][()]))
-                N = result['N']
-                if N > 0:
-                    result['t_first'] = float(f['t'][0, 0])
-                    result['t_last'] = float(f['t'][0, N - 1])
-
+        if os.path.isfile(self._file_path) and self._is_initialized:
+            with h5py.File(self._file_path, 'r') as f:
+                result.update(_stream_info(f, result['N']))
         return result
 
     # ============ Private: Validation ============
@@ -521,24 +697,20 @@ class TEA:
             raise ValueError("t must be strictly monotonically increasing")
 
     def _validate_regularity(self, t: ArrayFloat64) -> None:
+        """Within a segment 0.9/SR <= dt <= 1.1/SR; at least half the steps are within segments."""
         if len(t) < 2:
             return
         dt = np.diff(t)
         expected_dt = 1.0 / self._SR
-        gap_threshold = 1.1 * expected_dt
-        regular_mask = dt <= gap_threshold
+        if np.any(dt < MIN_DT_FACTOR * expected_dt):
+            raise ValueError(
+                f"is_regular=True but samples are closer than {MIN_DT_FACTOR} / SR "
+                f"(min dt {dt.min():.6g}, 1/SR {expected_dt:.6g})")
+        regular_mask = dt <= GAP_FACTOR * expected_dt
         regular_fraction = np.sum(regular_mask) / len(dt)
-
         if regular_fraction < 0.5:
             raise ValueError(
                 f"is_regular=True but only {regular_fraction * 100:.0f}% of dt values are within 1.1/SR")
-
-        if np.any(regular_mask):
-            regular_dt = dt[regular_mask]
-            max_dev = np.max(np.abs(regular_dt - expected_dt)) / expected_dt
-            if max_dev > 0.1:
-                raise ValueError(
-                    f"is_regular=True but within-segment dt deviates from 1/SR by {max_dev * 100:.1f}%")
 
     # ============ Private: File Creation ============
 
@@ -565,66 +737,49 @@ class TEA:
         with h5py.File(self._file_path, 'w', userblock_size=512) as f:
             # SR: scalar for regular, empty [] for irregular
             if self._SR is not None:
-                self._write_h5_scalar(f, 'SR', np.float64(self._SR))
+                write_scalar(f, 'SR', np.float64(self._SR))
             else:
                 ds_sr = f.create_dataset('SR', data=np.array([0, 0], dtype=np.uint64))
                 ds_sr.attrs['MATLAB_class'] = np.bytes_('double')
                 ds_sr.attrs['MATLAB_empty'] = np.uint8(1)
             # isRegular
-            self._write_h5_scalar(f, 'isRegular', self._is_regular, logical=True)
+            write_scalar(f, 'isRegular', self._is_regular, logical=True)
             # t: HDF5 (1, N_alloc), write first N values
             ds_t = f.create_dataset('t', shape=(1, N_alloc),
-                             maxshape=(1, None), chunks=(1, chunk_t),
-                             dtype=np.float64, **comp_kwargs)
+                                    maxshape=(1, None), chunks=(1, chunk_t),
+                                    dtype=np.float64, **comp_kwargs)
             ds_t.attrs['MATLAB_class'] = np.bytes_('double')
             ds_t[0, :N] = t
             # Samples: HDF5 (C_alloc, N_alloc), write first (C, N) values
             ds_s = f.create_dataset('Samples', shape=(C_alloc, N_alloc),
-                             maxshape=(None, None), chunks=(chunk_c, chunk_n),
-                             dtype=np.float64, **comp_kwargs)
+                                    maxshape=(None, None), chunks=(chunk_c, chunk_n),
+                                    dtype=np.float64, **comp_kwargs)
             ds_s.attrs['MATLAB_class'] = np.bytes_('double')
             ds_s[:C, :N] = samples.T
             # String metadata
-            self._write_h5_string(f, 'tea_version', self.tea_version)
+            write_string(f, 'tea_version', self.tea_version)
             if self.t_units:
-                self._write_h5_string(f, 't_units', self.t_units)
+                write_string(f, 't_units', self.t_units)
             # t_offset metadata
             if self._t_offset is not None:
-                self._write_h5_scalar(f, 't_offset', self._t_offset)
-                self._write_h5_string(f, 't_offset_units', self._t_offset_units)
-                self._write_h5_scalar(f, 't_offset_scale', float(self._t_offset_scale))
+                write_scalar(f, 't_offset', self._t_offset)
+                write_string(f, 't_offset_units', self._t_offset_units)
+                write_scalar(f, 't_offset_scale', float(self._t_offset_scale))
             # Dependent variables
             self._write_dependents(f, t)
 
             # hdr: free-form metadata stored as MATLAB struct group
             if self.hdr:
-                self._write_hdr_fields(f, self.hdr)
+                write_hdr_fields(f, self.hdr)
 
         # Write the 128-byte MATLAB v7.3 header into the userblock
-        self._write_matlab_header(self._file_path)
+        write_matlab_header(self._file_path)
 
         # Track logical and physical sizes
         self._N_written = N
         self._C_written = C
         self._N_allocated = N_alloc
         self._C_allocated = C_alloc
-
-    @staticmethod
-    def _write_matlab_header(file_path: str) -> None:
-        """Write the 128-byte MATLAB v7.3 MAT-file header into the userblock."""
-        desc = (f"MATLAB 7.3 MAT-file, Platform: Python, "
-                f"Created on: {time.strftime('%c')} "
-                f"HDF5 schema 1.00 .")
-        # Bytes 1-116: description (space-padded, ASCII)
-        desc_bytes = desc.encode('ascii')[:116].ljust(116, b' ')
-        # Bytes 117-124: subsys data offset (8 zero bytes)
-        # Bytes 125-126: version [0x00, 0x02]
-        # Bytes 127-128: endian indicator 'IM' (little-endian)
-        trailer = b'\x00' * 8 + b'\x00\x02' + b'IM'
-        header = desc_bytes + trailer  # 128 bytes total
-
-        with open(file_path, 'r+b') as fid:
-            fid.write(header)
 
     # ============ Private: Append ============
 
@@ -668,50 +823,8 @@ class TEA:
     # ============ Private: Dependents ============
 
     def _write_dependents(self, f: h5py.File, t: ArrayFloat64) -> None:
-        N = len(t)
-
-        # df_t_coarse
-        if self._is_regular and self._SR is not None and self._SR > 0:
-            df = max(1, round(self._SR))
-        else:
-            if N > 0 and (t[-1] - t[0]) > 0:
-                df = max(1, round(N / (t[-1] - t[0])))
-            else:
-                df = 1
-
-        # t_coarse
-        t_coarse = t[::df] if N > 0 else np.array([])
-        # t_coarse: MATLAB [M, 1] column vector
-        tc_data = t_coarse.reshape(-1, 1) if len(t_coarse) > 0 else np.zeros((0, 1))
-        self._write_h5_array(f, 't_coarse', tc_data)
-        self._write_h5_scalar(f, 'df_t_coarse', float(df))
-
-        # isContinuous, cont, disc
-        is_cont = True
-        if self._is_regular and self._SR is not None and self._SR > 0 and N > 1:
-            dt = np.diff(t)
-            gap_threshold = 1.1 / self._SR
-            gap_mask = dt > gap_threshold
-
-            if np.any(gap_mask):
-                is_cont = False
-                gap_idx = np.where(gap_mask)[0]  # 0-indexed
-                # Store as 1-indexed for MATLAB compatibility
-                disc = np.column_stack([gap_idx + 1, gap_idx + 2])  # [last_before, first_after] 1-indexed
-                starts = np.concatenate([[1], gap_idx + 2])
-                ends = np.concatenate([gap_idx + 1, [N]])
-                cont = np.column_stack([starts, ends])
-                # Pass in MATLAB shape [n, 2]; helper handles HDF5 transposition
-                self._write_h5_array(f, 'disc', disc.astype(np.float64))
-                self._write_h5_array(f, 'cont', cont.astype(np.float64))
-
-        if is_cont:
-            # Remove disc/cont if they exist (was continuous)
-            for var in ['disc', 'cont']:
-                if var in f:
-                    del f[var]
-
-        self._write_h5_scalar(f, 'isContinuous', is_cont, logical=True)
+        """Recompute and store every dependent from the full t vector."""
+        _write_dependent_datasets(f, *dependents(t, self._SR, self._is_regular))
 
     def _update_dependents_incremental(self, f: h5py.File, t_new: ArrayFloat64,
                                        t_last: float, N_old: int,
@@ -727,7 +840,7 @@ class TEA:
 
         # === isContinuous / cont / disc ===
         if self._is_regular and self._SR is not None and self._SR > 0:
-            gap_threshold = 1.1 / self._SR
+            gap_threshold = GAP_FACTOR / self._SR
 
             old_is_cont = bool(np.squeeze(f['isContinuous'][()]))
             if not old_is_cont and 'disc' in f:
@@ -757,19 +870,19 @@ class TEA:
             all_disc = np.vstack([old_disc, new_gap_arr]) if (old_disc.size > 0 or new_gap_arr.size > 0) else np.zeros((0, 2))
 
             if all_disc.size == 0 or all_disc.shape[0] == 0:
-                self._write_h5_scalar(f, 'isContinuous', True, logical=True)
+                write_scalar(f, 'isContinuous', True, logical=True)
                 for var in ['disc', 'cont']:
                     if var in f:
                         del f[var]
             else:
-                self._write_h5_scalar(f, 'isContinuous', False, logical=True)
-                self._write_h5_array(f, 'disc', all_disc)  # MATLAB [n, 2]
+                write_scalar(f, 'isContinuous', False, logical=True)
+                write_array(f, 'disc', all_disc)  # MATLAB [n, 2]
                 starts = np.concatenate([[1], all_disc[:, 1]])
                 ends = np.concatenate([all_disc[:, 0], [N_total]])
                 cont = np.column_stack([starts, ends])
-                self._write_h5_array(f, 'cont', cont)  # MATLAB [n, 2]
+                write_array(f, 'cont', cont)  # MATLAB [n, 2]
         else:
-            self._write_h5_scalar(f, 'isContinuous', True, logical=True)
+            write_scalar(f, 'isContinuous', True, logical=True)
 
         # === t_coarse ===
         df = int(np.squeeze(f['df_t_coarse'][()]))
@@ -789,252 +902,20 @@ class TEA:
             new_coarse_locals = new_coarse_locals[valid]
             new_tc = t_new[new_coarse_locals]
             combined_tc = np.concatenate([old_tc, new_tc])
-            self._write_h5_array(f, 't_coarse', combined_tc.reshape(-1, 1))  # MATLAB [M, 1]
+            write_array(f, 't_coarse', combined_tc.reshape(-1, 1))  # MATLAB [M, 1]
 
-    # ============ Private: Read Helpers ============
+    # ============ HDF5 helpers (kept as aliases of tea_h5) ============
 
-    def _resolve_channels(self, f: h5py.File, channels: list[int] | None,
-                          total_C: int) -> np.ndarray | None:
-        if channels is None:
-            return None
-        if 'ch_map' in f:
-            file_ch_map = np.squeeze(f['ch_map'][()]).ravel()
-        else:
-            file_ch_map = np.arange(1, total_C + 1)
-
-        indices = []
-        for ch in channels:
-            found = np.where(file_ch_map == ch)[0]
-            if len(found) == 0:
-                raise ValueError(f"Channel {ch} not found in ch_map")
-            indices.append(found[0])
-        return np.array(indices)
-
-    def _find_range_from_time(self, f: h5py.File,
-                              t_range: tuple[float, float],
-                              total_N: int) -> tuple[int, int]:
-        if total_N == 0:
-            return 0, -1
-
-        t_start_req, t_end_req = t_range
-        t_first = float(f['t'][0, 0])
-        t_last = float(f['t'][0, total_N - 1])
-
-        if t_start_req > t_last or t_end_req < t_first:
-            return 0, -1  # out of range
-
-        t_start = max(t_start_req, t_first)
-        t_end = min(t_end_req, t_last)
-
-        has_tc = 't_coarse' in f and 'df_t_coarse' in f
-        if not has_tc:
-            # Full t load fallback
-            full_t = f['t'][0, :]
-            s_start = int(np.searchsorted(full_t, t_start, side='left'))
-            s_end = int(np.searchsorted(full_t, t_end, side='right') - 1)
-            return s_start, s_end
-
-        # Use t_coarse for fast lookup
-        tc = f['t_coarse'][()].ravel()
-        df = int(np.squeeze(f['df_t_coarse'][()]))
-
-        # Find start
-        if t_start <= t_first:
-            s_start = 0
-        else:
-            d_idx = np.searchsorted(tc, t_start, side='left')
-            ws = max(0, (d_idx - 1) * df)
-            we = min((d_idx + 1) * df, total_N)
-            tw = f['t'][0, ws:we]
-            ri = np.searchsorted(tw, t_start, side='left')
-            s_start = ws + ri
-
-        # Find end
-        if t_end >= t_last:
-            s_end = total_N - 1
-        else:
-            d_idx = np.searchsorted(tc, t_end, side='right')
-            ws = max(0, (d_idx - 1) * df)
-            we = min((d_idx + 1) * df, total_N)
-            tw = f['t'][0, ws:we]
-            ri = np.searchsorted(tw, t_end, side='right') - 1
-            s_end = ws + max(0, ri)
-
-        s_start = max(0, min(s_start, total_N - 1))
-        s_end = max(0, min(s_end, total_N - 1))
-        return int(s_start), int(s_end)
-
-    def _compute_disc_info(self, t_out: ArrayFloat64) -> dict:
-        NN = len(t_out)
-        result = {'is_discontinuous': False,
-                  'cont': np.zeros((0, 2)),
-                  'disc': np.zeros((0, 2))}
-
-        if NN < 2 or not self._is_regular:
-            if NN > 0:
-                result['cont'] = np.array([[0, NN - 1]])
-            return result
-
-        if self._SR is None or self._SR <= 0:
-            result['cont'] = np.array([[0, NN - 1]])
-            return result
-
-        dt = np.diff(t_out)
-        gap_mask = dt > 1.1 / self._SR
-
-        if np.any(gap_mask):
-            result['is_discontinuous'] = True
-            gi = np.where(gap_mask)[0]
-            result['disc'] = np.column_stack([gi, gi + 1])
-            starts = np.concatenate([[0], gi + 1])
-            ends = np.concatenate([gi, [NN - 1]])
-            result['cont'] = np.column_stack([starts, ends])
-        else:
-            result['cont'] = np.array([[0, NN - 1]])
-
-        return result
-
-    # ============ Private: HDF5 Helpers ============
-
-    @staticmethod
-    def _write_h5_scalar(f: h5py.File, name: str,
-                         value: int | float, logical: bool = False) -> None:
-        """Write a scalar value as a MATLAB-compatible HDF5 dataset (shape [1,1])."""
-        if name in f:
-            del f[name]
-        if logical:
-            ds = f.create_dataset(name, data=np.array([[np.uint8(1 if value else 0)]], dtype=np.uint8))
-            ds.attrs['MATLAB_class'] = np.bytes_('logical')
-            ds.attrs['MATLAB_int_decode'] = np.int32(1)
-        else:
-            ds = f.create_dataset(name, data=np.array([[np.float64(value)]]))
-            ds.attrs['MATLAB_class'] = np.bytes_('double')
-
-    @staticmethod
-    def _write_h5_array(f: h5py.File, name: str, data: npt.ArrayLike) -> None:
-        """Write a numeric array as a MATLAB-compatible HDF5 dataset.
-
-        Data is transposed for HDF5 storage so MATLAB reads correct dimensions.
-        Caller provides data in MATLAB-logical shape (e.g. (1, N) for row vector);
-        stored as HDF5 (N, 1) so MATLAB sees [1, N].
-        """
-        if name in f:
-            del f[name]
-        arr = np.asarray(data, dtype=np.float64)
-        ds = f.create_dataset(name, data=arr.T)
-        ds.attrs['MATLAB_class'] = np.bytes_('double')
-
-    @staticmethod
-    def _write_h5_string(f: h5py.File, name: str, value: str) -> None:
-        """Write a string as a MATLAB-compatible HDF5 dataset (row vector)."""
-        if name in f:
-            del f[name]
-        # Store as uint16 column in HDF5 (len, 1) → MATLAB sees [1, len] row vector
-        encoded = np.array([ord(c) for c in value], dtype=np.uint16).reshape(-1, 1)  # shape (len, 1)
-        ds = f.create_dataset(name, data=encoded)
-        ds.attrs['MATLAB_class'] = np.bytes_('char')
-        ds.attrs['MATLAB_int_decode'] = np.int32(2)
-
-    @staticmethod
-    def _write_hdr_fields(f: h5py.File, hdr_dict: dict) -> None:
-        """Write hdr dict as a MATLAB-compatible struct group.
-
-        Creates an HDF5 group '/hdr' with MATLAB_class='struct'.
-        Each dict key becomes a field in the struct:
-          - list[str]  → 2D char matrix (use cellstr() in MATLAB)
-          - str        → char row vector
-          - int/float  → double scalar
-          - np.ndarray → double array
-        """
-        if 'hdr' in f:
-            del f['hdr']
-        hdr_grp = f.create_group('hdr')
-        hdr_grp.attrs['MATLAB_class'] = np.bytes_('struct')
-
-        for key, val in hdr_dict.items():
-            if isinstance(val, list) and len(val) > 0 and all(isinstance(v, str) for v in val):
-                # List of strings → 2D char matrix (MATLAB char array)
-                # MATLAB: cellstr(hdr.field) to get cell array of strings
-                max_len = max(len(s) for s in val)
-                char_arr = np.zeros((len(val), max_len), dtype=np.uint16)
-                for i, s in enumerate(val):
-                    for j, ch in enumerate(s):
-                        char_arr[i, j] = ord(ch)
-                # Transpose: MATLAB (N, M) stored as HDF5 (M, N)
-                ds = hdr_grp.create_dataset(key, data=char_arr.T)
-                ds.attrs['MATLAB_class'] = np.bytes_('char')
-                ds.attrs['MATLAB_int_decode'] = np.int32(2)
-            elif isinstance(val, str):
-                encoded = np.array([ord(c) for c in val], dtype=np.uint16).reshape(-1, 1)
-                ds = hdr_grp.create_dataset(key, data=encoded)
-                ds.attrs['MATLAB_class'] = np.bytes_('char')
-                ds.attrs['MATLAB_int_decode'] = np.int32(2)
-            elif isinstance(val, (int, float, np.integer, np.floating)):
-                ds = hdr_grp.create_dataset(key, data=np.array([[np.float64(val)]]))
-                ds.attrs['MATLAB_class'] = np.bytes_('double')
-            elif isinstance(val, np.ndarray):
-                arr = val.astype(np.float64)
-                stored = arr.T if arr.ndim > 1 else arr.reshape(1, -1)
-                ds = hdr_grp.create_dataset(key, data=stored)
-                ds.attrs['MATLAB_class'] = np.bytes_('double')
+    _write_h5_scalar = staticmethod(write_scalar)
+    _write_h5_array = staticmethod(write_array)
+    _write_h5_string = staticmethod(write_string)
+    _write_hdr_fields = staticmethod(write_hdr_fields)
+    _write_matlab_header = staticmethod(write_matlab_header)
 
 
 # =====================================================================
 # Schema version 2: several sample rates in one file
 # =====================================================================
-
-
-def _schema_version_of(f: h5py.File) -> int:
-    """Schema version stored in an open file; 1 when the file has none."""
-    if 'schema_version' in f:
-        return int(round(float(np.squeeze(f['schema_version'][()]))))
-    return 1
-
-
-def _write_char_matrix(g: h5py.Group, name: str, strings: Sequence[str]) -> None:
-    """Write strings as a MATLAB char matrix, one row per string, space padded.
-
-    MATLAB reads it as a [len(strings) x max_len] char array; cellstr() gives
-    the cell array of names.
-    """
-    if name in g:
-        del g[name]
-    max_len = max([1] + [len(s) for s in strings])
-    arr = np.full((len(strings), max_len), ord(' '), dtype=np.uint16)
-    for i, s in enumerate(strings):
-        arr[i, :len(s)] = [ord(c) for c in s]
-    ds = g.create_dataset(name, data=arr.T)  # MATLAB [n, len] stored as HDF5 (len, n)
-    ds.attrs['MATLAB_class'] = np.bytes_('char')
-    ds.attrs['MATLAB_int_decode'] = np.int32(2)
-
-
-def _read_char_matrix(ds: h5py.Dataset) -> list[str] | None:
-    """Rows of a MATLAB char matrix, trailing spaces and NULs removed.
-
-    Returns None when the dataset is not a char array (e.g. a MATLAB cell).
-    """
-    data = ds[()]
-    if not np.issubdtype(np.asarray(data).dtype, np.integer):
-        return None
-    rows = np.atleast_2d(np.asarray(data)).T  # HDF5 (len, n) -> (n, len)
-    return [''.join(chr(c) for c in row).rstrip(' \x00') for row in rows]
-
-
-def _read_scalar(f: h5py.Group, name: str, default=None):
-    """A MATLAB scalar (or None when absent or stored empty)."""
-    if name not in f:
-        return default
-    ds = f[name]
-    if ds.attrs.get('MATLAB_empty', 0):
-        return default
-    return np.squeeze(ds[()]).item()
-
-
-def _read_string(f: h5py.Group, name: str, default: str = '') -> str:
-    if name not in f:
-        return default
-    rows = _read_char_matrix(f[name])
-    return ''.join(rows) if rows is not None else default
 
 
 def _find_rate(rates: Sequence[float | None], rate: float | None) -> int:
@@ -1072,7 +953,7 @@ class Stream:
     is_regular: bool = True
 
 
-class TEAStream(TEA):
+class TEAStream:
     """Read-only view of one stream (one sample rate) of a TEA file.
 
     Has the `TEA` read API (`read`, `N`, `C`, `ch_map`, `info`) plus `rate`,
@@ -1085,26 +966,15 @@ class TEAStream(TEA):
                  schema_version: int, t_units: str = '',
                  t_offset: int | float | None = None, t_offset_units: str = '',
                  t_offset_scale: float = 1.0) -> None:
-        # Bound to an existing group; TEA.__init__'s new-file checks do not apply.
         self._file_path = str(file_path)
         self._group = group
-        self._schema_version = schema_version
+        self._schema_version = int(schema_version)
         self._SR = float(rate) if rate is not None else None
         self._is_regular = bool(is_regular)
         self.t_units = t_units
         self._t_offset = t_offset
         self._t_offset_units = t_offset_units
         self._t_offset_scale = float(t_offset_scale)
-        self.hdr = {}
-        self.tea_version = ''
-        self._compress = False
-        self._expected_length = None
-        self._expected_channels = None
-        self._is_initialized = True
-        self._N_written = None
-        self._C_written = None
-        self._N_allocated = None
-        self._C_allocated = None
         self._channel_names = list(channel_names)
         self._units = list(units)
 
@@ -1112,10 +982,31 @@ class TEAStream(TEA):
         return (f"TEAStream({self._file_path!r}, group={self._group!r}, "
                 f"rate={self._SR}, N={self.N}, C={self.C})")
 
+    # ---- properties ----
+
+    @property
+    def file_path(self) -> str:
+        return self._file_path
+
+    @property
+    def group(self) -> str:
+        """HDF5 group holding this stream's t and Samples."""
+        return self._group
+
+    @property
+    def schema_version(self) -> int:
+        return self._schema_version
+
     @property
     def rate(self) -> float | None:
         """Sample rate of this stream."""
         return self._SR
+
+    SR = rate
+
+    @property
+    def is_regular(self) -> bool:
+        return self._is_regular
 
     @property
     def channel_names(self) -> list[str]:
@@ -1126,31 +1017,69 @@ class TEAStream(TEA):
         return list(self._units)
 
     @property
-    def group(self) -> str:
-        """HDF5 group holding this stream's t and Samples."""
-        return self._group
+    def t_offset(self):
+        return self._t_offset
+
+    @property
+    def t_offset_units(self) -> str:
+        return self._t_offset_units
+
+    @property
+    def t_offset_scale(self) -> float:
+        return self._t_offset_scale
+
+    @property
+    def N(self) -> int:
+        """Sample count."""
+        with h5py.File(self._file_path, 'r') as f:
+            return f[self._group]['t'].shape[1]
+
+    @property
+    def C(self) -> int:
+        """Channel count."""
+        with h5py.File(self._file_path, 'r') as f:
+            return f[self._group]['Samples'].shape[0]
+
+    @property
+    def ch_map(self) -> ArrayFloat64:
+        """Channel identity vector (`ch_map` when stored, else 1..C)."""
+        with h5py.File(self._file_path, 'r') as f:
+            g = f[self._group]
+            if 'ch_map' in g:
+                return np.squeeze(g['ch_map'][()]).ravel().astype(np.float64)
+            return np.arange(1, g['Samples'].shape[0] + 1, dtype=np.float64)
+
+    # ---- read ----
+
+    def read(self, channels=None, t_range: tuple[float, float] | None = None,
+             s_range: tuple[int, int] | None = None,
+             ) -> tuple[np.ndarray, ArrayFloat64, dict]:
+        """Read `(Data, t_out, disc_info)`; `channels` by number (ch_map) or name."""
+        with h5py.File(self._file_path, 'r') as f:
+            return _read_samples(f[self._group], self._SR, self._is_regular,
+                                 channels, t_range, s_range, self._channel_names)
 
     def info(self) -> dict:
-        result = super().info()
+        with h5py.File(self._file_path, 'r') as f:
+            g = f[self._group]
+            N, C = g['t'].shape[1], g['Samples'].shape[0]
+            result = {
+                'file_path': self._file_path,
+                'SR': self._SR,
+                'is_regular': self._is_regular,
+                'N': N,
+                'C': C,
+                'ch_map': self.ch_map,
+                't_units': self.t_units,
+                't_offset': self._t_offset,
+                't_offset_units': self._t_offset_units,
+                't_offset_scale': self._t_offset_scale,
+                'schema_version': self._schema_version,
+            }
+            result.update(_stream_info(g, N))
         result.update(rate=self._SR, channel_names=self.channel_names,
                       units=self.units, group=self._group)
         return result
-
-    def _resolve_channels(self, f, channels, total_C):
-        if channels is None:
-            return None
-        by_number = [c for c in channels if not isinstance(c, str)]
-        numbered = iter(super()._resolve_channels(f, by_number, total_C)
-                        if by_number else [])
-        indices = []
-        for c in channels:
-            if isinstance(c, str):
-                if c not in self._channel_names:
-                    raise ValueError(f"Channel {c!r} not found")
-                indices.append(self._channel_names.index(c))
-            else:
-                indices.append(next(numbered))
-        return np.array(indices, dtype=int)
 
     def _read_only(self, *args, **kwargs):
         raise RuntimeError("A TEAStream is read-only; write with tea.write() or tea.Writer.")
@@ -1170,15 +1099,15 @@ class TEAFile:
     def __init__(self, file_path: str) -> None:
         self.file_path = str(file_path)
         with h5py.File(self.file_path, 'r') as f:
-            self.schema_version = _schema_version_of(f)
+            self.schema_version = schema_version_of(f)
             if self.schema_version > SCHEMA_VERSION:
                 raise ValueError(
                     f"{self.file_path} is TEA schema version {self.schema_version}; "
                     f"this reader knows up to {SCHEMA_VERSION}.")
-            self.t_units = _read_string(f, 't_units')
-            self.t_offset = _read_scalar(f, 't_offset')
-            self.t_offset_units = _read_string(f, 't_offset_units')
-            self.t_offset_scale = float(_read_scalar(f, 't_offset_scale', 1.0))
+            self.t_units = read_string(f, 't_units')
+            self.t_offset = read_scalar(f, 't_offset')
+            self.t_offset_units = read_string(f, 't_offset_units')
+            self.t_offset_scale = float(read_scalar(f, 't_offset_scale', 1.0))
             self._streams = []
             if self.schema_version >= 2:
                 groups = sorted(f[RATES_GROUP].keys(), key=lambda k: int(k[1:]))
@@ -1186,13 +1115,13 @@ class TEAFile:
                     g = f[RATES_GROUP][k]
                     self._streams.append(self._make_stream(
                         f'/{RATES_GROUP}/{k}', g,
-                        _read_char_matrix(g['channel_names']),
-                        _read_char_matrix(g['units'])))
+                        read_char_matrix(g['channel_names']),
+                        read_char_matrix(g['units'])))
             elif 't' in f and 'Samples' in f:
                 C = f['Samples'].shape[0]
                 names = None
                 if 'hdr' in f and 'channel_names' in f['hdr']:
-                    names = _read_char_matrix(f['hdr']['channel_names'])
+                    names = read_char_matrix(f['hdr']['channel_names'])
                 if names is None or len(names) != C:
                     if 'ch_map' in f:
                         ch_map = np.squeeze(f['ch_map'][()]).ravel()
@@ -1203,8 +1132,8 @@ class TEAFile:
 
     def _make_stream(self, group: str, g: h5py.Group, names, units) -> TEAStream:
         return TEAStream(
-            self.file_path, group, _read_scalar(g, 'SR'),
-            bool(_read_scalar(g, 'isRegular', True)), names, units,
+            self.file_path, group, read_scalar(g, 'SR'),
+            bool(read_scalar(g, 'isRegular', True)), names, units,
             schema_version=self.schema_version, t_units=self.t_units,
             t_offset=self.t_offset, t_offset_units=self.t_offset_units,
             t_offset_scale=self.t_offset_scale)
@@ -1296,7 +1225,7 @@ class Writer:
         self._f: h5py.File | None = h5py.File(self.file_path, 'w', userblock_size=512)
         rates = self._f.create_group(RATES_GROUP)
         rates.attrs['MATLAB_class'] = np.bytes_('struct')
-        TEA._write_h5_scalar(self._f, 'schema_version', float(SCHEMA_VERSION))
+        write_scalar(self._f, 'schema_version', float(SCHEMA_VERSION))
 
     def __enter__(self) -> 'Writer':
         return self
@@ -1338,10 +1267,10 @@ class Writer:
         ds_s = g.create_dataset('Samples', shape=(C, 0), maxshape=(C, None),
                                 chunks=(C, chunk_samples(C)), dtype=np.float64, **self._comp)
         ds_s.attrs['MATLAB_class'] = np.bytes_('double')
-        TEA._write_h5_scalar(g, 'SR', rate)
-        TEA._write_h5_scalar(g, 'isRegular', is_regular, logical=True)
-        _write_char_matrix(g, 'channel_names', names)
-        _write_char_matrix(g, 'units', unit_list)
+        write_scalar(g, 'SR', rate)
+        write_scalar(g, 'isRegular', is_regular, logical=True)
+        write_char_matrix(g, 'channel_names', names)
+        write_char_matrix(g, 'units', unit_list)
         self._streams.append(_StreamState(rate, bool(is_regular), names, unit_list, g))
 
     def append(self, rate: float, t: npt.ArrayLike, samples: npt.ArrayLike) -> None:
@@ -1363,11 +1292,11 @@ class Writer:
         if np.any(dt <= 0):
             raise ValueError("t must be strictly increasing (and start after the previous append)")
         if st.is_regular:
-            if np.any(dt < 0.9 / st.rate):
-                raise ValueError(f"Samples closer than 0.9 / rate in a stream marked regular "
-                                 f"(rate {st.rate:g})")
+            if np.any(dt < MIN_DT_FACTOR / st.rate):
+                raise ValueError(f"Samples closer than {MIN_DT_FACTOR} / rate in a stream "
+                                 f"marked regular (rate {st.rate:g})")
             base = st.n - 1 if st.t_last is not None else 0  # global 0-based index of tt[0]
-            for j in np.flatnonzero(dt > 1.1 / st.rate):
+            for j in np.flatnonzero(dt > GAP_FACTOR / st.rate):
                 st.disc.append((base + j + 1, base + j + 2))
             first = -(-st.n // st.df) * st.df  # first coarse index >= st.n
             st.t_coarse.append(t[np.arange(first - st.n, n, st.df)])
@@ -1393,19 +1322,19 @@ class Writer:
                     raise ValueError(f"Stream {st.rate:g} has no samples")
                 self._write_stream_dependents(st)
 
-            TEA._write_h5_string(f, 'tea_version', '2.0')
+            write_string(f, 'tea_version', '2.0')
             if self._t_units:
-                TEA._write_h5_string(f, 't_units', self._t_units)
+                write_string(f, 't_units', self._t_units)
             if self._t_offset is not None:
-                TEA._write_h5_scalar(f, 't_offset', self._t_offset)
-                TEA._write_h5_string(f, 't_offset_units', self._t_offset_units)
-                TEA._write_h5_scalar(f, 't_offset_scale', self._t_offset_scale)
+                write_scalar(f, 't_offset', self._t_offset)
+                write_string(f, 't_offset_units', self._t_offset_units)
+                write_scalar(f, 't_offset_scale', self._t_offset_scale)
             all_names = [n for st in self._streams for n in st.names]
-            _write_char_matrix(f, 'channel_names', all_names)
-            TEA._write_h5_array(f, 'channel_rates',
-                                np.array([[st.rate for st in self._streams for _ in st.names]]).T)
+            write_char_matrix(f, 'channel_names', all_names)
+            write_array(f, 'channel_rates',
+                        np.array([[st.rate for st in self._streams for _ in st.names]]).T)
             if self._hdr:
-                TEA._write_hdr_fields(f, self._hdr)
+                write_hdr_fields(f, self._hdr)
 
             if len(self._streams) == 1:
                 # Version-1 readers look for these at the top level: hard links,
@@ -1417,28 +1346,20 @@ class Writer:
         finally:
             f.close()
             self._f = None
-        TEA._write_matlab_header(self.file_path)
+        write_matlab_header(self.file_path)
 
     @staticmethod
     def _write_stream_dependents(st: _StreamState) -> None:
+        """Store the dependents gathered during `append` (regular) or recomputed (irregular)."""
         g = st.g
         if st.is_regular:
-            df = st.df
             t_coarse = np.concatenate(st.t_coarse)
-        else:
-            t = g['t'][0, :]
-            span = t[-1] - t[0]
-            df = max(1, round(st.n / span)) if span > 0 else 1
-            t_coarse = t[::df]
-        TEA._write_h5_array(g, 't_coarse', t_coarse.reshape(-1, 1))  # MATLAB [M, 1]
-        TEA._write_h5_scalar(g, 'df_t_coarse', float(df))
-        if st.disc:
-            disc = np.array(st.disc, dtype=np.float64)
+            disc = np.array(st.disc, dtype=np.float64).reshape(-1, 2)
             cont = np.column_stack([np.concatenate([[1], disc[:, 1]]),
                                     np.concatenate([disc[:, 0], [st.n]])])
-            TEA._write_h5_array(g, 'disc', disc)  # MATLAB [n, 2]
-            TEA._write_h5_array(g, 'cont', cont)
-        TEA._write_h5_scalar(g, 'isContinuous', not st.disc, logical=True)
+            _write_dependent_datasets(g, t_coarse, st.df, disc, cont, not st.disc)
+        else:
+            _write_dependent_datasets(g, *dependents(g['t'][0, :], st.rate, False))
 
 
 def write(file_path: str | os.PathLike, streams: Sequence[Stream], *,
