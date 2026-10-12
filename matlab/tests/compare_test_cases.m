@@ -1,7 +1,8 @@
 %% compare_test_cases.m — Compare Python vs MATLAB TEA files from MATLAB's perspective.
 %
-% For each case K=1..9, reads py_caseK.mat and ml_caseK.mat via matfile()
-% and compares every variable for identical values.
+% For each case K=1..10, reads py_caseK.mat and ml_caseK.mat via matfile()
+% and compares every variable for identical values (and the class of
+% Samples, which case 10 stores as int32).
 %
 % Tolerance: doubles < 1e-12, char/logical exact.
 
@@ -20,7 +21,7 @@ function compare_test_cases()
     total_pass = 0;
     total_fail = 0;
 
-    for k = 1:9
+    for k = 1:10
         py_file = fullfile(cv_dir, sprintf('py_case%d.mat', k));
         ml_file = fullfile(cv_dir, sprintf('ml_case%d.mat', k));
 
@@ -78,6 +79,13 @@ function [n_pass, n_fail] = compare_files(py_file, ml_file)
 
         val_py = mf_py.(var);
         val_ml = mf_ml.(var);
+
+        % Stored class of Samples must agree (case 10: int32)
+        if strcmp(var, 'Samples') && ~strcmp(class(val_py), class(val_ml))
+            fprintf('  %-20s FAIL (class: %s vs %s)\n', var, class(val_py), class(val_ml));
+            n_fail = n_fail + 1;
+            continue;
+        end
 
         % Char comparison
         if ischar(val_py) && ischar(val_ml)

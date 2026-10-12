@@ -719,5 +719,70 @@ classdef test_tea < matlab.unittest.TestCase
             tc.verifyEqual(D, samples, 'AbsTol', 1e-12);
         end
 
+        %% Test 38: int32 counts with scale/offset (schema 1)
+        function test_int32_with_scale(tc)
+            f = fullfile(tc.temp_dir, 'int32.mat');
+            SR = 1000; N = 3000;
+            t = (0:N-1)' / SR;
+            counts = int32(round(randn(N, 2) * 1000));
+            scale = [0.1 0.2]; offset = [0 5];
+
+            tea = TEA(f, SR, true, 't_units', 's', 'scale', scale, 'offset', offset);
+            tea.write(t, counts);
+            tc.verifyEqual(tea.scale, scale);
+            tc.verifyEqual(tea.offset, offset);
+            mf = matfile(f);
+            tc.verifyClass(mf.Samples, 'int32');
+            tc.verifyEqual(mf.scale, scale);
+            tc.verifyEqual(mf.offset, offset);
+            info = h5info(f, '/Samples');
+            tc.verifyEqual(info.ChunkSize, [min(N, TEA.chunk_samples(2, 'int32')) 2]);
+
+            phys = double(counts) .* scale + offset;
+            [D, t_out] = tea.read([], [], []);
+            tc.verifyClass(D, 'double');
+            tc.verifyEqual(D, phys, 'AbsTol', 1e-12);
+            tc.verifyEqual(t_out, t, 'AbsTol', 1e-12);
+            D = tea.read([2], [1.0, 1.5], [], 'DataType', 'int');
+            sel = t >= 1.0 & t <= 1.5;
+            tc.verifyClass(D, 'int32');
+            tc.verifyEqual(D, counts(sel, 2));
+            D = tea.read([1 2], [], [1, 10], 'DataType', 'single');
+            tc.verifyClass(D, 'single');
+            tc.verifyEqual(D, single(phys(1:10, :)), 'AbsTol', 1e-3);
+            s = tea.info();
+            tc.verifyEqual(s.dtype, 'int32');
+            tc.verifyTrue(s.scaled);
+
+            % Append counts; reopen takes scale from the file
+            t2 = t(end) + (1:10)' / SR;
+            tea.write(t2, int32(7 * ones(10, 2)));
+            tea2 = TEA(f, SR, true);
+            tc.verifyEqual(tea2.scale, scale);
+            D = tea2.read([], [], [N + 1, N + 10]);
+            tc.verifyEqual(D, repmat(7 * scale + offset, 10, 1), 'AbsTol', 1e-12);
+            tc.verifyError(@() TEA(f, SR, true, 'scale', [1 1]), 'TEA:ScaleMismatch');
+            tc.verifyError(@() tea2.write_channels(int32(zeros(N + 10, 1))), 'TEA:ScaledFile');
+
+            % scale needs integer Samples; a scalar scale broadcasts
+            g = fullfile(tc.temp_dir, 'bad.mat');
+            tea3 = TEA(g, SR, true, 'scale', 0.5);
+            tc.verifyError(@() tea3.write(t, randn(N, 2)), 'TEA:ScaleNeedsInteger');
+            tea3.write(t, int16(ones(N, 3)));
+            tc.verifyEqual(tea3.scale, [0.5 0.5 0.5]);
+            tc.verifyEqual(tea3.read(), 0.5 * ones(N, 3));
+            tc.verifyEqual(TEA(g, SR, true).info().dtype, 'int16');
+
+            % Without scale an integer file reads as stored, double on request
+            h = fullfile(tc.temp_dir, 'raw.mat');
+            TEA(h, SR, true).write(t, counts);
+            D = TEA(h, SR, true).read();
+            tc.verifyClass(D, 'int32');
+            tc.verifyEqual(D, counts);
+            D = TEA(h, SR, true).read([], [], [], 'DataType', 'double');
+            tc.verifyEqual(D, double(counts));
+            tc.verifyFalse(TEA(h, SR, true).info().scaled);
+        end
+
     end
 end

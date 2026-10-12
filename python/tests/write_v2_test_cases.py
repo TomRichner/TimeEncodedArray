@@ -48,6 +48,20 @@ def main(out_dir: str) -> None:
               [Stream(200, ['a', 'b', 'c', 'd'], 'uV', ramp(1500, 4), t200)],
               t_offset=T_OFFSET)
 
+    # int32 counts with per-channel scale/offset: physical = counts * scale + offset
+    t500 = np.arange(2000) / 500
+    counts = ramp(2000, 2).astype(np.int32)
+    tea.write(os.path.join(out_dir, 'v2_int_scaled.mat'),
+              [Stream(500, ['a', 'b'], 'uV', counts, t500, dtype=np.int32,
+                      scale=[0.1, 0.5], offset=[0.0, -2.0])],
+              t_offset=T_OFFSET, compress=True)
+
+    # single-precision physical values
+    tea.write(os.path.join(out_dir, 'v2_single.mat'),
+              [Stream(256, ['Fp1', 'Fp2'], 'uV', ramp(1024, 2, 0.25), np.arange(1024) / 256,
+                      dtype=np.float32)],
+              t_offset=T_OFFSET)
+
     v1 = os.path.join(out_dir, 'v1_python.mat')
     if os.path.exists(v1):
         os.remove(v1)

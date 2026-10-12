@@ -1,7 +1,7 @@
-%% write_test_cases.m — Write 9 deterministic TEA test files.
+%% write_test_cases.m — Write 10 deterministic TEA test files.
 %
 % Each case uses hardcoded data identical to write_test_cases.py.
-% Output: cross_validation_data/ml_case{1..9}.mat
+% Output: cross_validation_data/ml_case{1..10}.mat
 %
 % Run from TimeEncodedArray/matlab/tests/
 
@@ -23,8 +23,9 @@ function write_test_cases()
     case7(cv_dir);
     case8(cv_dir);
     case9(cv_dir);
+    case10(cv_dir);
 
-    fprintf('\nAll 9 MATLAB test cases written to: %s\n', cv_dir);
+    fprintf('\nAll 10 MATLAB test cases written to: %s\n', cv_dir);
 end
 
 
@@ -171,4 +172,17 @@ function case9(cv_dir)
         't_offset_scale', 1.0);
     tea.write(t, s);
     fprintf('  Case 9: ml_case9.mat\n');
+end
+
+
+function case10(cv_dir)
+    %% Case 10: Write 2000x2 int32 counts with scale [0.1 0.5], offset [0 -2], SR=500
+    f = fullfile(cv_dir, 'ml_case10.mat');
+    if exist(f,'file'), delete(f); end
+    SR = 500; N = 2000;
+    t = (0:N-1)' / SR;
+    counts = int32(reshape(0:2*N-1, 2, N)' - 2000);   % row by row, as Python's reshape(2000, 2)
+    tea = TEA(f, SR, true, 't_units', 's', 'scale', [0.1 0.5], 'offset', [0 -2]);
+    tea.write(t, counts);
+    fprintf('  Case 10: ml_case10.mat\n');
 end

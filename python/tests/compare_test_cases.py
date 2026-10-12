@@ -1,8 +1,9 @@
 """
 compare_test_cases.py — Compare Python vs MATLAB TEA files from Python's perspective.
 
-For each case K=1..9, reads py_caseK.mat and ml_caseK.mat via h5py
-and compares every variable for identical values.
+For each case K=1..10, reads py_caseK.mat and ml_caseK.mat via h5py
+and compares every variable for identical values (and the stored class of
+Samples, which case 10 writes as int32).
 
 Tolerance: doubles < 1e-12, char/logical/int exact.
 """
@@ -65,6 +66,11 @@ def compare_files(py_file, ml_file):
                 n_fail += 1
                 continue
 
+            if var == 'Samples' and fpy[var].dtype != fml[var].dtype:
+                print(f"  {var:<20s} FAIL (dtype: {fpy[var].dtype} vs {fml[var].dtype})")
+                n_fail += 1
+                continue
+
             val_py = read_matlab_var(fpy, var)
             val_ml = read_matlab_var(fml, var)
 
@@ -123,7 +129,7 @@ def main():
     total_pass = 0
     total_fail = 0
 
-    for k in range(1, 10):
+    for k in range(1, 11):
         py_file = os.path.join(cv_dir, f'py_case{k}.mat')
         ml_file = os.path.join(cv_dir, f'ml_case{k}.mat')
 

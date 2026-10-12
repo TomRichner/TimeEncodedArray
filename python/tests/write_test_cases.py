@@ -1,8 +1,8 @@
 """
-write_test_cases.py — Write 8 deterministic TEA test files.
+write_test_cases.py — Write 10 deterministic TEA test files.
 
 Each case uses hardcoded data identical to write_test_cases.m.
-Output: cross_validation_data/py_case{1..8}.mat
+Output: cross_validation_data/py_case{1..10}.mat
 """
 
 import sys
@@ -162,13 +162,25 @@ def case9(cv_dir):
     return f
 
 
+def case10(cv_dir):
+    """Write 2000x2 int32 counts with scale [0.1, 0.5] and offset [0, -2], SR=500."""
+    f = os.path.join(cv_dir, 'py_case10.mat')
+    clean(f)
+    SR = 500
+    t = np.arange(2000, dtype=np.float64) / SR
+    counts = np.arange(4000, dtype=np.int32).reshape(2000, 2) - 2000
+    tea = TEA(f, SR, True, t_units='s', dtype=np.int32, scale=[0.1, 0.5], offset=[0.0, -2.0])
+    tea.write(t, counts)
+    return f
+
+
 def main():
     cv_dir = get_cv_dir()
-    cases = [case1, case2, case3, case4, case5, case6, case7, case8, case9]
+    cases = [case1, case2, case3, case4, case5, case6, case7, case8, case9, case10]
     for i, fn in enumerate(cases, 1):
         f = fn(cv_dir)
         print(f"  Case {i}: {os.path.basename(f)}")
-    print(f"\nAll 9 Python test cases written to: {cv_dir}")
+    print(f"\nAll 10 Python test cases written to: {cv_dir}")
 
 
 if __name__ == '__main__':

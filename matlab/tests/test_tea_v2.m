@@ -26,7 +26,8 @@ classdef test_tea_v2 < matlab.unittest.TestCase
             repo = fileparts(matlab_dir);
             addpath(matlab_dir);
             tc.data_dir = fullfile(repo, 'cross_validation_data', 'v2');
-            needed = {'v2_two_rates.mat', 'v2_two_rates_compressed.mat', 'v2_one_rate.mat', 'v1_python.mat'};
+            needed = {'v2_two_rates.mat', 'v2_two_rates_compressed.mat', 'v2_one_rate.mat', ...
+                'v1_python.mat', 'v2_int_scaled.mat', 'v2_single.mat'};
             have = @() all(cellfun(@(f) exist(fullfile(tc.data_dir, f), 'file') == 2, needed));
             if ~have()
                 cmd = sprintf('uv run --directory "%s" python python/tests/write_v2_test_cases.py', repo);
@@ -238,6 +239,78 @@ classdef test_tea_v2 < matlab.unittest.TestCase
             copyfile(f, g);
             tea2 = TEA(g, 200, true);
             tc.verifyError(@() tea2.write(20 + (0:9)' / 200, zeros(10, 4)), 'TEA:Version2File');
+        end
+
+        %% int32 counts with scale/offset: physical by default, single or counts on request
+        function test_int_scaled(tc)
+            f = tc.v2file('v2_int_scaled.mat');
+            t = (0:1999)' / 500;
+            counts = int32(test_tea_v2.ramp(2000, 2));
+            scale = [0.1 0.5]; offset = [0 -2];
+            phys = double(counts) .* scale + offset;
+
+            tea = TEA(f, 500, true);
+            st = tea.stream(500);
+            tc.verifyEqual(st.dtype, 'int32');
+            tc.verifyEqual(st.scale, scale);
+            tc.verifyEqual(st.offset, offset);
+            tc.verifyEqual(st.units, {'uV', 'uV'});
+            [D, t_out] = st.read();
+            tc.verifyClass(D, 'double');
+            tc.verifyEqual(D, phys, 'AbsTol', 1e-12);
+            tc.verifyEqual(t_out, t, 'AbsTol', 1e-12);
+            D = st.read([], [], [], 'DataType', 'single');
+            tc.verifyClass(D, 'single');
+            tc.verifyEqual(D, single(phys), 'AbsTol', 1e-3);
+            D = st.read({'b', 1}, [], [11, 20], 'DataType', 'int');
+            tc.verifyClass(D, 'int32');
+            tc.verifyEqual(D, counts(11:20, [2 1]));
+            D = st.read({'b', 1}, [1.0, 1.1], []);
+            sel = t >= 1.0 & t <= 1.1;
+            tc.verifyEqual(D, phys(sel, [2 1]), 'AbsTol', 1e-12);
+            s = st.info();
+            tc.verifyEqual(s.dtype, 'int32');
+            tc.verifyTrue(s.scaled);
+            tc.verifyError(@() st.read([], [], [], 'DataType', 'bogus'), 'TEA:InvalidDataType');
+
+            % One stream: the schema-1 reader sees scale at the top level
+            tc.verifyEqual(tea.scale, scale);
+            tc.verifyEqual(tea.offset, offset);
+            [D1, t1] = tea.read([], [], []);
+            tc.verifyEqual(D1, phys, 'AbsTol', 1e-12);
+            tc.verifyEqual(t1, t, 'AbsTol', 1e-12);
+            D1 = tea.read([2], [], [1, 5], 'DataType', 'int');
+            tc.verifyEqual(D1, counts(1:5, 2));
+            D1 = tea.read([2], [], [1, 5], 'Samples', 'DataType', 'single');
+            tc.verifyClass(D1, 'single');
+            s1 = tea.info();
+            tc.verifyEqual(s1.dtype, 'int32');
+            tc.verifyTrue(s1.scaled);
+            S = load(f);
+            tc.verifyClass(S.Samples, 'int32');
+            tc.verifyEqual(S.scale, scale);
+            tc.verifyEqual(S.rates.r1.offset, offset);
+            % Compressed int32: chunk rule uses 4 bytes per sample
+            info = h5info(f, '/rates/r1/Samples');
+            tc.verifyEqual(info.ChunkSize, [TEA.chunk_samples(2, 'int32') 2]);
+        end
+
+        %% single-precision stream reads back as single, double on request
+        function test_single_stream(tc)
+            f = tc.v2file('v2_single.mat');
+            x = single(test_tea_v2.ramp(1024, 2, 0.25));
+            st = TEA(f, 256, true).stream();
+            tc.verifyEqual(st.dtype, 'single');
+            tc.verifyEmpty(st.scale);
+            [D, t] = st.read();
+            tc.verifyClass(D, 'single');
+            tc.verifyEqual(D, x);
+            tc.verifyEqual(t, (0:1023)' / 256, 'AbsTol', 1e-12);
+            D = st.read({'Fp2'}, [], [1, 10], 'DataType', 'double');
+            tc.verifyClass(D, 'double');
+            tc.verifyEqual(D, double(x(1:10, 2)));
+            tc.verifyError(@() st.read([], [], [], 'DataType', 'int'), 'TEA:NotCounts');
+            tc.verifyFalse(st.info().scaled);
         end
 
     end
