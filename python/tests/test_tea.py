@@ -739,6 +739,67 @@ class TestCompression:
             assert hf['Samples'].compression is None
 
 
+# ============ Test: Storage class and scale (schema 1) ============
+
+class TestStorageClass:
+    def test_int32_with_scale(self, temp_dir):
+        f = mat_path(temp_dir, 'int32')
+        SR, N = 1000, 3000
+        t = np.arange(N) / SR
+        x = np.random.randn(N, 2) * 100
+        tea = TEA(f, SR, True, t_units='s', dtype=np.int32, scale=[0.1, 0.2], offset=[0, 5])
+        tea.write(t, x)
+        assert tea.dtype == np.int32
+        import h5py
+        with h5py.File(f, 'r') as hf:
+            assert hf['Samples'].dtype == np.int32
+            assert hf['Samples'].attrs['MATLAB_class'] == b'int32'
+            np.testing.assert_array_equal(hf['scale'][()].ravel(), [0.1, 0.2])
+            np.testing.assert_array_equal(hf['offset'][()].ravel(), [0, 5])
+            counts = hf['Samples'][()].T
+        Data, _, _ = tea.read()
+        assert Data.dtype == np.float64
+        assert np.all(np.abs(Data - x) <= np.array([0.1, 0.2]) / 2 + 1e-12)
+        np.testing.assert_allclose(Data, counts * [0.1, 0.2] + [0, 5])
+        Dc, _, _ = tea.read(channels=[2], dtype='int')
+        np.testing.assert_array_equal(Dc[:, 0], counts[:, 1])
+        # Append more (float input converted, int input stored as given)
+        t2 = t[-1] + np.arange(1, 11) / SR
+        tea.write(t2, np.ones((10, 2)))
+        tea.write(t2[-1] + np.arange(1, 11) / SR, np.full((10, 2), 7, dtype=np.int32))
+        Dc, _, _ = tea.read(s_range=(N, N + 19), dtype='int')
+        np.testing.assert_array_equal(Dc[:10], np.tile([10, -20], (10, 1)))
+        np.testing.assert_array_equal(Dc[10:], 7)
+        # Reopen: dtype and scale come from the file
+        tea2 = TEA(f, SR, True)
+        assert tea2.dtype == np.int32
+        np.testing.assert_array_equal(tea2.scale, [0.1, 0.2])
+        assert tea2.info()['dtype'] == 'int32'
+        with pytest.raises(ValueError, match='write_channels'):
+            tea2.write_channels(np.zeros((tea2.N, 1)))
+
+    def test_float32_and_int_without_scale(self, temp_dir):
+        f = mat_path(temp_dir, 'single')
+        t = np.arange(100) / 100
+        x = np.random.randn(100, 1)
+        tea = TEA(f, 100, True, dtype='single')
+        tea.write(t, x)
+        Data, _, _ = tea.read()
+        assert Data.dtype == np.float32
+        np.testing.assert_array_equal(Data, x.astype(np.float32))
+        tea.write_channels(x)  # cast to the file's class
+        assert tea.C == 2
+        with pytest.raises(ValueError, match='integer'):
+            TEA(mat_path(temp_dir, 'bad'), 100, True, dtype=np.float32, scale=0.1)
+
+        g = mat_path(temp_dir, 'int16')
+        counts = (np.random.randn(100, 2) * 1000).astype(np.int16)
+        TEA(g, 100, True, dtype=np.int16).write(t, counts)
+        Data, _, _ = TEA(g, 100, True).read()
+        assert Data.dtype == np.int16
+        np.testing.assert_array_equal(Data, counts)
+
+
 # ============ Test: Pre-allocation ============
 
 class TestPreallocation:

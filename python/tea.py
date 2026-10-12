@@ -70,7 +70,148 @@ RATES_GROUP = 'rates'
 # Datasets of a stream group that a one-rate version-2 file also links at the
 # top level, so version-1 readers find them where they expect them.
 _V1_LINKED = ('t', 'Samples', 'SR', 'isRegular', 't_coarse', 'df_t_coarse',
-              'isContinuous', 'cont', 'disc')
+              'isContinuous', 'cont', 'disc', 'scale', 'offset')
+
+# Storage classes the writers accept for Samples, with their MATLAB class names.
+STORAGE_CLASSES = {
+    np.dtype(np.float64): 'double',
+    np.dtype(np.float32): 'single',
+    np.dtype(np.int16): 'int16',
+    np.dtype(np.int32): 'int32',
+    np.dtype(np.int64): 'int64',
+}
+_DTYPE_ALIASES = {'double': np.float64, 'single': np.float32}
+
+
+# =====================================================================
+# Storage class, scale and offset
+# =====================================================================
+
+
+def storage_dtype(dtype) -> np.dtype:
+    """The numpy dtype of a storage class (`np.int32`, `'int32'`, `'single'`, ...)."""
+    if isinstance(dtype, str) and dtype in _DTYPE_ALIASES:
+        dtype = _DTYPE_ALIASES[dtype]
+    dt = np.dtype(dtype)
+    if dt not in STORAGE_CLASSES:
+        raise ValueError(f"dtype {dt} is not a TEA storage class; use one of "
+                         f"{', '.join(v for v in STORAGE_CLASSES.values())}")
+    return dt
+
+
+def _scaling(dtype: np.dtype, scale, offset, C: int
+             ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """`scale` and `offset` as (C,) float64 arrays, or (None, None) when unscaled.
+
+    Only an integer storage class may carry them. `offset` without `scale`
+    means a scale of 1; `scale` without `offset` means an offset of 0.
+    """
+    if scale is None and offset is None:
+        return None, None
+    if not np.issubdtype(dtype, np.integer):
+        raise ValueError(f"scale and offset need an integer dtype, not {dtype}")
+    scale_arr = np.broadcast_to(np.asarray(1.0 if scale is None else scale, dtype=np.float64),
+                                (C,)).copy()
+    offset_arr = np.broadcast_to(np.asarray(0.0 if offset is None else offset, dtype=np.float64),
+                                 (C,)).copy()
+    if not np.all(np.isfinite(scale_arr)) or np.any(scale_arr == 0):
+        raise ValueError("scale must be finite and non-zero")
+    if not np.all(np.isfinite(offset_arr)):
+        raise ValueError("offset must be finite")
+    return scale_arr, offset_arr
+
+
+def _write_scaling(g: h5py.Group, scale: np.ndarray | None, offset: np.ndarray | None) -> None:
+    if scale is not None:
+        write_array(g, 'scale', scale.reshape(1, -1))    # MATLAB [1 x C]
+        write_array(g, 'offset', offset.reshape(1, -1))  # MATLAB [1 x C]
+
+
+def _read_scaling(g: h5py.Group) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """The stream's `scale` and `offset` as (C,) float64, or (None, None).
+
+    A floating `Samples` dataset never carries them: a stray pair is ignored
+    with a warning.
+    """
+    if 'scale' not in g:
+        return None, None
+    C = g['Samples'].shape[0]
+    if not np.issubdtype(g['Samples'].dtype, np.integer):
+        warnings.warn(f"{g.file.filename}:{g.name}: scale on {g['Samples'].dtype} "
+                      "Samples ignored (scaling applies to integer counts)", stacklevel=2)
+        return None, None
+    scale = np.asarray(g['scale'][()], dtype=np.float64).ravel()
+    offset = (np.asarray(g['offset'][()], dtype=np.float64).ravel() if 'offset' in g
+              else np.zeros_like(scale))
+    if scale.shape != (C,) or offset.shape != (C,):
+        raise ValueError(f"{g.file.filename}:{g.name}: scale/offset have "
+                         f"{scale.size}/{offset.size} values for {C} channels")
+    return scale, offset
+
+
+def to_storage(x: np.ndarray, dtype: np.dtype, scale: np.ndarray | None = None,
+               offset: np.ndarray | None = None,
+               names: Sequence[str] | None = None) -> np.ndarray:
+    """Cast (n, C) samples to the storage class.
+
+    Floating input for an integer class is converted to counts,
+    `rint((x - offset) / scale)` (scale 1, offset 0 when unscaled), and must
+    fit the class; integer input is stored as counts as given (checked for
+    range when the class differs). Floating classes just cast.
+    """
+    x = np.asarray(x)
+    if x.dtype == dtype:
+        return x
+    if not np.issubdtype(dtype, np.integer):
+        return x.astype(dtype)
+    info = np.iinfo(dtype)
+    if np.issubdtype(x.dtype, np.integer):
+        counts = x.astype(np.int64)
+    elif np.issubdtype(x.dtype, np.floating):
+        y = x.astype(np.float64)
+        if scale is not None:
+            y = (y - offset) / scale
+        counts = np.rint(y)
+    else:
+        raise ValueError(f"samples must be numeric, not {x.dtype}")
+    bad = ~((counts >= info.min) & (counts <= info.max))  # also True for NaN
+    if np.any(bad):
+        j = int(np.flatnonzero(bad.any(axis=0))[0]) if bad.ndim == 2 else 0
+        ch = names[j] if names is not None and j < len(names) else f'column {j}'
+        raise ValueError(f"Samples for channel {ch} do not fit {STORAGE_CLASSES[dtype]} "
+                         f"counts (range {info.min} to {info.max}); use a wider dtype "
+                         "or a larger scale")
+    return counts.astype(dtype)
+
+
+def _requested_dtype(dtype):
+    """Normalise a reader's `dtype` request: None, a float dtype, or 'int'/an int dtype."""
+    if dtype is None:
+        return None
+    if isinstance(dtype, str) and dtype.lower() in ('int', 'counts'):
+        return 'int'
+    return storage_dtype(dtype)
+
+
+def apply_scale(data: np.ndarray, scale: np.ndarray | None, offset: np.ndarray | None,
+                dtype=None) -> np.ndarray:
+    """Return the (n, C) read window in the requested form.
+
+    `scale`/`offset` are the (C,) factors of the selected channels (None when
+    the stream is unscaled). `dtype=None` gives physical float64 when scaled,
+    else the data as stored; a float dtype gives physical values in that
+    type; 'int' (or an integer dtype) gives the stored counts and refuses
+    floating data.
+    """
+    req = _requested_dtype(dtype)
+    if req == 'int' or (req is not None and np.issubdtype(req, np.integer)):
+        if not np.issubdtype(data.dtype, np.integer):
+            raise ValueError(f"the stream holds {data.dtype} samples, not integer counts")
+        return data if req == 'int' or req == data.dtype else to_storage(data, req)
+    if scale is None:
+        return data if req is None else data.astype(req)
+    phys = data.astype(np.float64) * scale + offset
+    return phys if req is None or req == np.float64 else phys.astype(req)
 
 # Regularity: within a continuous segment 0.9/SR <= dt <= 1.1/SR; a larger
 # step is a gap (discontinuity), a smaller one is an error.
@@ -236,19 +377,27 @@ def _compute_disc_info(t_out: np.ndarray, rate: float | None, is_regular: bool) 
 def _read_samples(g: h5py.Group, rate: float | None, is_regular: bool,
                   channels=None, t_range: tuple[float, float] | None = None,
                   s_range: tuple[int, int] | None = None,
-                  channel_names: Sequence[str] | None = None,
+                  channel_names: Sequence[str] | None = None, dtype=None,
                   ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Read `(Data, t_out, disc_info)` from a stream group (`t` and `Samples`).
 
     `channels` are numbers (through `ch_map`) or, when `channel_names` is
     given, names; `t_range` and `s_range` (0-based inclusive) are exclusive.
+    `dtype` selects the form of Data (see `apply_scale`): physical float64
+    when the stream has `scale`, as stored otherwise.
     """
     if t_range is not None and s_range is not None:
         raise ValueError("Specify either t_range or s_range, not both.")
+    req = _requested_dtype(dtype)  # validate before touching the file
     total_N = g['t'].shape[1]
     total_C = g['Samples'].shape[0]
 
     channel_indices = _resolve_channels(g, channels, total_C, channel_names)
+    scale, offset = _read_scaling(g)
+    if channel_indices is not None and scale is not None:
+        scale, offset = scale[channel_indices], offset[channel_indices]
+    out_dtype = (np.float64 if scale is not None else g['Samples'].dtype) if req is None else (
+        g['Samples'].dtype if req == 'int' else req)
 
     if s_range is not None:
         s_start, s_end = int(s_range[0]), int(s_range[1])
@@ -264,7 +413,7 @@ def _read_samples(g: h5py.Group, rate: float | None, is_regular: bool,
     if total_N == 0 or s_start > s_end or s_start < 0:
         empty_disc = {'is_discontinuous': False,
                       'cont': np.zeros((0, 2)), 'disc': np.zeros((0, 2))}
-        return np.zeros((0, n_ch)), np.zeros(0), empty_disc
+        return np.zeros((0, n_ch), dtype=out_dtype), np.zeros(0), empty_disc
 
     t_out = g['t'][0, s_start:s_end + 1]
 
@@ -276,6 +425,7 @@ def _read_samples(g: h5py.Group, rate: float | None, is_regular: bool,
     else:
         data = g['Samples'][:, s_start:s_end + 1].T
 
+    data = apply_scale(data, scale, offset, req)
     return data, t_out, _compute_disc_info(t_out, rate, is_regular)
 
 
@@ -315,7 +465,8 @@ class TEA:
                  hdr: dict | None = None, tea_version: str = '1.0',
                  compress: bool = False,
                  expected_length: int | None = None,
-                 expected_channels: int | None = None) -> None:
+                 expected_channels: int | None = None,
+                 dtype=None, scale=None, offset=None) -> None:
         """
         Create or bind to a TEA file.
 
@@ -332,6 +483,13 @@ class TEA:
             compress: If True, use DEFLATE level 1 (no shuffle) on t and Samples
             expected_length: Pre-allocate N samples (avoids resize on append)
             expected_channels: Pre-allocate C channels (avoids resize on write_channels)
+            dtype: Storage class of Samples: float64 (default for a new file),
+                float32, int16, int32 or int64. For an existing file the stored
+                class is used; giving a different one is an error.
+            scale, offset: Per-channel (or one) factors for an integer dtype:
+                physical = counts * scale + offset. Written on file creation
+                and checked against the channel count then; readers return
+                physical values by default when they are present.
         """
         self._file_path = str(file_path)
         self._SR = float(SR) if SR is not None else None
@@ -347,6 +505,12 @@ class TEA:
         self._expected_channels = int(expected_channels) if expected_channels is not None else None
         self._is_initialized = False
         self._schema_version = 1
+        self._dtype = storage_dtype(dtype) if dtype is not None else np.dtype(np.float64)
+        self._scale_in, self._offset_in = scale, offset  # broadcast on creation
+        self._scale: np.ndarray | None = None
+        self._offset: np.ndarray | None = None
+        if (scale is not None or offset is not None) and not np.issubdtype(self._dtype, np.integer):
+            raise ValueError(f"scale and offset need an integer dtype, not {self._dtype}")
 
         # Pre-allocation tracking (logical vs physical sizes)
         self._N_written: int | None = None   # logical sample count
@@ -383,8 +547,35 @@ class TEA:
                             f"isRegular mismatch: file has {file_ir} but constructor says {is_regular}")
                 self._is_initialized = ('t' in f and 'Samples' in f)
                 self._schema_version = schema_version_of(f)
+                if self._is_initialized:
+                    file_dtype = f['Samples'].dtype
+                    if dtype is not None and file_dtype != self._dtype:
+                        raise ValueError(
+                            f"dtype mismatch: file has {file_dtype} but constructor says {self._dtype}")
+                    self._dtype = file_dtype
+                    self._scale, self._offset = _read_scaling(f)
+                    if scale is not None or offset is not None:
+                        s, o = _scaling(self._dtype, scale, offset, f['Samples'].shape[0])
+                        if self._scale is None or not (np.array_equal(s, self._scale)
+                                                       and np.array_equal(o, self._offset)):
+                            raise ValueError("scale/offset mismatch with the existing file")
 
     # ============ Properties ============
+
+    @property
+    def dtype(self) -> np.dtype:
+        """Storage class of Samples (the file's once it exists)."""
+        return self._dtype
+
+    @property
+    def scale(self) -> np.ndarray | None:
+        """Per-channel scale of an integer file, (C,) float64, or None."""
+        return None if self._scale is None else self._scale.copy()
+
+    @property
+    def offset(self) -> np.ndarray | None:
+        """Per-channel offset of an integer file, (C,) float64, or None."""
+        return None if self._offset is None else self._offset.copy()
 
     @property
     def schema_version(self) -> int:
@@ -471,7 +662,7 @@ class TEA:
         """
         self._refuse_v2_write()
         t = np.asarray(t, dtype=np.float64).ravel()
-        samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
+        samples = np.atleast_2d(np.asarray(samples))
         if samples.ndim == 2 and samples.shape[0] == 1 and len(t) > 1:
             samples = samples.T
 
@@ -481,6 +672,12 @@ class TEA:
             raise ValueError(
                 f"Samples must have {N_new} rows to match t, but has {samples.shape[0]}")
         C_new = samples.shape[1]
+        if not self._is_initialized and self._scale is None:
+            self._scale, self._offset = _scaling(self._dtype, self._scale_in, self._offset_in, C_new)
+        if self._scale is not None and C_new != len(self._scale):
+            raise ValueError(
+                f"Channel count mismatch: file has {len(self._scale)} but write has {C_new}.")
+        samples = to_storage(samples, self._dtype, self._scale, self._offset)
 
         if self._is_regular:
             self._validate_regularity(t)
@@ -542,8 +739,11 @@ class TEA:
         if not self._is_initialized:
             raise RuntimeError("Cannot append channels before any data has been written.")
         self._refuse_v2_write()
+        if self._scale is not None:
+            raise ValueError("write_channels is not supported on a file with per-channel "
+                             "scale/offset; write all channels in write()")
 
-        samples = np.atleast_2d(np.asarray(samples, dtype=np.float64))
+        samples = to_storage(np.atleast_2d(np.asarray(samples)), self._dtype)
 
         with h5py.File(self._file_path, 'r+') as f:
             N_written = self._N_written if self._N_written is not None else f['t'].shape[1]
@@ -623,8 +823,8 @@ class TEA:
 
     def read(self, channels: list[int] | None = None,
              t_range: tuple[float, float] | None = None,
-             s_range: tuple[int, int] | None = None,
-             ) -> tuple[ArrayFloat64, ArrayFloat64, dict]:
+             s_range: tuple[int, int] | None = None, *, dtype=None,
+             ) -> tuple[np.ndarray, ArrayFloat64, dict]:
         """
         Read data from the TEA file.
 
@@ -632,6 +832,10 @@ class TEA:
             channels: Channel numbers (uses ch_map). None for all.
             t_range: (start, end) in t units. None to skip.
             s_range: (start, end) sample indices, 0-indexed inclusive. None to skip.
+            dtype: None (default): physical float64 when the file has `scale`,
+                else as stored; np.float32 / np.float64: physical values in that
+                type; 'int' (or an integer dtype): the stored counts, an error
+                for a floating file.
 
         Returns:
             (Data, t_out, disc_info) tuple.
@@ -646,7 +850,8 @@ class TEA:
                     f"{self._file_path} holds several sample rates "
                     f"({', '.join(f'{r:g}' for r in read(self._file_path).rates)}); "
                     "read one with .stream(rate).read(...)")
-            return _read_samples(f, self._SR, self._is_regular, channels, t_range, s_range)
+            return _read_samples(f, self._SR, self._is_regular, channels, t_range, s_range,
+                                 dtype=dtype)
 
     # ============ Refresh ============
 
@@ -680,6 +885,8 @@ class TEA:
             't_offset_units': self._t_offset_units,
             't_offset_scale': self._t_offset_scale,
             'schema_version': self._schema_version,
+            'dtype': STORAGE_CLASSES.get(self._dtype, str(self._dtype)),
+            'scaled': self._scale is not None,
         }
         if os.path.isfile(self._file_path) and self._is_initialized:
             with h5py.File(self._file_path, 'r') as f:
@@ -721,7 +928,7 @@ class TEA:
         N_alloc = max(N, self._expected_length or N)
         C_alloc = max(C, self._expected_channels or C)
         chunk_c = max(1, C_alloc)
-        chunk_n = min(chunk_samples(chunk_c), max(1, N_alloc))
+        chunk_n = min(chunk_samples(chunk_c, self._dtype), max(1, N_alloc))
         chunk_t = min(chunk_samples(1), max(1, N_alloc))
 
         # Compression kwargs for t and Samples datasets
@@ -753,8 +960,8 @@ class TEA:
             # Samples: HDF5 (C_alloc, N_alloc), write first (C, N) values
             ds_s = f.create_dataset('Samples', shape=(C_alloc, N_alloc),
                                     maxshape=(None, None), chunks=(chunk_c, chunk_n),
-                                    dtype=np.float64, **comp_kwargs)
-            ds_s.attrs['MATLAB_class'] = np.bytes_('double')
+                                    dtype=self._dtype, **comp_kwargs)
+            ds_s.attrs['MATLAB_class'] = np.bytes_(STORAGE_CLASSES[self._dtype])
             ds_s[:C, :N] = samples.T
             # String metadata
             write_string(f, 'tea_version', self.tea_version)
@@ -765,6 +972,8 @@ class TEA:
                 write_scalar(f, 't_offset', self._t_offset)
                 write_string(f, 't_offset_units', self._t_offset_units)
                 write_scalar(f, 't_offset_scale', float(self._t_offset_scale))
+            # Per-channel scale and offset of integer counts
+            _write_scaling(f, self._scale, self._offset)
             # Dependent variables
             self._write_dependents(f, t)
 
@@ -939,11 +1148,15 @@ class Stream:
     Attributes:
         rate: Sample rate in samples per t unit (Hz when t is in seconds).
         channel_names: One name per column of `samples`.
-        units: One unit string per channel, or one string for all (e.g. 'uV').
-        samples: (n, ch) float64 array.
+        units: One unit string per channel, or one string for all (e.g. 'uV'):
+            the physical unit, after scaling when `scale` is given.
+        samples: (n, ch) array; converted to `dtype` (see `Writer.append`).
         t: (n,) timestamps, strictly increasing, relative to t_offset. Gaps are
             allowed: a step larger than 1.1 / rate starts a new segment.
         is_regular: True when samples are evenly spaced within segments.
+        dtype: Storage class: float64 (default), float32, int16, int32, int64.
+        scale, offset: Per-channel (or one) factors for an integer dtype,
+            physical = counts * scale + offset.
     """
     rate: float
     channel_names: Sequence[str]
@@ -951,21 +1164,27 @@ class Stream:
     samples: npt.ArrayLike
     t: npt.ArrayLike
     is_regular: bool = True
+    dtype: npt.DTypeLike = np.float64
+    scale: float | Sequence[float] | None = None
+    offset: float | Sequence[float] | None = None
 
 
 class TEAStream:
     """Read-only view of one stream (one sample rate) of a TEA file.
 
     Has the `TEA` read API (`read`, `N`, `C`, `ch_map`, `info`) plus `rate`,
-    `channel_names` and `units`. `read(channels=...)` accepts channel numbers
-    (1-based, or the file's ch_map) and channel names.
+    `channel_names`, `units`, `dtype` (stored class), `scale` and `offset`.
+    `read(channels=...)` accepts channel numbers (1-based, or the file's
+    ch_map) and channel names; `read(dtype=...)` picks physical values or
+    counts (see `apply_scale`).
     """
 
     def __init__(self, file_path: str, group: str, rate: float | None,
                  is_regular: bool, channel_names: list[str], units: list[str], *,
                  schema_version: int, t_units: str = '',
                  t_offset: int | float | None = None, t_offset_units: str = '',
-                 t_offset_scale: float = 1.0) -> None:
+                 t_offset_scale: float = 1.0, dtype=np.float64,
+                 scale: np.ndarray | None = None, offset: np.ndarray | None = None) -> None:
         self._file_path = str(file_path)
         self._group = group
         self._schema_version = int(schema_version)
@@ -977,6 +1196,24 @@ class TEAStream:
         self._t_offset_scale = float(t_offset_scale)
         self._channel_names = list(channel_names)
         self._units = list(units)
+        self._dtype = np.dtype(dtype)
+        self._scale = scale
+        self._offset = offset
+
+    @property
+    def dtype(self) -> np.dtype:
+        """Storage class of Samples (what `read(dtype='int')` returns for counts)."""
+        return self._dtype
+
+    @property
+    def scale(self) -> np.ndarray | None:
+        """Per-channel scale (C,) of an integer stream, or None when unscaled."""
+        return None if self._scale is None else self._scale.copy()
+
+    @property
+    def offset(self) -> np.ndarray | None:
+        """Per-channel offset (C,) of an integer stream, or None when unscaled."""
+        return None if self._offset is None else self._offset.copy()
 
     def __repr__(self) -> str:
         return (f"TEAStream({self._file_path!r}, group={self._group!r}, "
@@ -1052,12 +1289,18 @@ class TEAStream:
     # ---- read ----
 
     def read(self, channels=None, t_range: tuple[float, float] | None = None,
-             s_range: tuple[int, int] | None = None,
+             s_range: tuple[int, int] | None = None, *, dtype=None,
              ) -> tuple[np.ndarray, ArrayFloat64, dict]:
-        """Read `(Data, t_out, disc_info)`; `channels` by number (ch_map) or name."""
+        """Read `(Data, t_out, disc_info)`; `channels` by number (ch_map) or name.
+
+        `dtype`: None gives physical float64 when the stream has `scale`, else
+        the samples as stored; np.float32 / np.float64 give physical values in
+        that type; 'int' (or an integer dtype) gives the stored counts and is
+        an error for a floating stream.
+        """
         with h5py.File(self._file_path, 'r') as f:
             return _read_samples(f[self._group], self._SR, self._is_regular,
-                                 channels, t_range, s_range, self._channel_names)
+                                 channels, t_range, s_range, self._channel_names, dtype)
 
     def info(self) -> dict:
         with h5py.File(self._file_path, 'r') as f:
@@ -1075,6 +1318,8 @@ class TEAStream:
                 't_offset_units': self._t_offset_units,
                 't_offset_scale': self._t_offset_scale,
                 'schema_version': self._schema_version,
+                'dtype': STORAGE_CLASSES.get(self._dtype, str(self._dtype)),
+                'scaled': self._scale is not None,
             }
             result.update(_stream_info(g, N))
         result.update(rate=self._SR, channel_names=self.channel_names,
@@ -1093,6 +1338,7 @@ class TEAFile:
     Attributes:
         file_path, schema_version, rates, channel_names (all streams, in
         stream order), channel_rates (rate of each of those channels),
+        channel_scales (scale of each, None for unscaled streams),
         t_units, t_offset, t_offset_units, t_offset_scale.
     """
 
@@ -1131,12 +1377,14 @@ class TEAFile:
                 self._streams.append(self._make_stream('/', f, names, [''] * C))
 
     def _make_stream(self, group: str, g: h5py.Group, names, units) -> TEAStream:
+        scale, offset = _read_scaling(g)
         return TEAStream(
             self.file_path, group, read_scalar(g, 'SR'),
             bool(read_scalar(g, 'isRegular', True)), names, units,
             schema_version=self.schema_version, t_units=self.t_units,
             t_offset=self.t_offset, t_offset_units=self.t_offset_units,
-            t_offset_scale=self.t_offset_scale)
+            t_offset_scale=self.t_offset_scale, dtype=g['Samples'].dtype,
+            scale=scale, offset=offset)
 
     def __repr__(self) -> str:
         return (f"TEAFile({self.file_path!r}, schema_version={self.schema_version}, "
@@ -1159,6 +1407,12 @@ class TEAFile:
     def channel_rates(self) -> list[float]:
         return [s.rate for s in self._streams for _ in s.channel_names]
 
+    @property
+    def channel_scales(self) -> list[float | None]:
+        """Scale of each channel (counts to physical), None for unscaled streams."""
+        return [None if s.scale is None else float(s.scale[i])
+                for s in self._streams for i in range(len(s.channel_names))]
+
     def stream(self, rate: float | None = None) -> TEAStream:
         """The stream with this sample rate (`rate` may be omitted for one stream)."""
         return self._streams[_find_rate(self.rates, rate)]
@@ -1179,12 +1433,16 @@ class _StreamState:
     """Writer bookkeeping for one stream."""
 
     def __init__(self, rate: float, is_regular: bool, names: list[str],
-                 units: list[str], group: h5py.Group) -> None:
+                 units: list[str], group: h5py.Group, dtype: np.dtype,
+                 scale: np.ndarray | None, offset: np.ndarray | None) -> None:
         self.rate = rate
         self.is_regular = is_regular
         self.names = names
         self.units = units
         self.g = group
+        self.dtype = dtype
+        self.scale = scale
+        self.offset = offset
         self.n = 0
         self.t_last: float | None = None
         self.disc: list[tuple[int, int]] = []  # 1-indexed [last_before, first_after]
@@ -1242,11 +1500,19 @@ class Writer:
         return [s.rate for s in self._streams]
 
     def add_stream(self, rate: float, channel_names: Sequence[str],
-                   units: str | Sequence[str], *, is_regular: bool = True) -> None:
-        """Declare a stream; its data follows through `append(rate, t, samples)`."""
+                   units: str | Sequence[str], *, is_regular: bool = True,
+                   dtype=np.float64, scale=None, offset=None) -> None:
+        """Declare a stream; its data follows through `append(rate, t, samples)`.
+
+        `dtype` is the storage class of Samples (float64, float32, int16, int32
+        or int64). `scale` and `offset` (one value or one per channel) are
+        allowed with an integer dtype only: physical = counts * scale + offset,
+        and `units` names the physical unit.
+        """
         if self._f is None:
             raise RuntimeError("Writer is closed")
         rate = float(rate)
+        dtype = storage_dtype(dtype)
         if not rate > 0:
             raise ValueError("rate must be positive")
         if any(abs(r - rate) <= 1e-9 * max(1.0, rate) for r in self.rates):
@@ -1259,27 +1525,36 @@ class Writer:
             raise ValueError(f"{len(unit_list)} units for {len(names)} channels")
 
         C = len(names)
+        scale_arr, offset_arr = _scaling(dtype, scale, offset, C)
         g = self._f[RATES_GROUP].create_group(f'r{len(self._streams) + 1}')
         g.attrs['MATLAB_class'] = np.bytes_('struct')
         ds_t = g.create_dataset('t', shape=(1, 0), maxshape=(1, None),
                                 chunks=(1, chunk_samples(1)), dtype=np.float64, **self._comp)
         ds_t.attrs['MATLAB_class'] = np.bytes_('double')
         ds_s = g.create_dataset('Samples', shape=(C, 0), maxshape=(C, None),
-                                chunks=(C, chunk_samples(C)), dtype=np.float64, **self._comp)
-        ds_s.attrs['MATLAB_class'] = np.bytes_('double')
+                                chunks=(C, chunk_samples(C, dtype)), dtype=dtype, **self._comp)
+        ds_s.attrs['MATLAB_class'] = np.bytes_(STORAGE_CLASSES[dtype])
         write_scalar(g, 'SR', rate)
         write_scalar(g, 'isRegular', is_regular, logical=True)
         write_char_matrix(g, 'channel_names', names)
         write_char_matrix(g, 'units', unit_list)
-        self._streams.append(_StreamState(rate, bool(is_regular), names, unit_list, g))
+        _write_scaling(g, scale_arr, offset_arr)
+        self._streams.append(_StreamState(rate, bool(is_regular), names, unit_list, g,
+                                          dtype, scale_arr, offset_arr))
 
     def append(self, rate: float, t: npt.ArrayLike, samples: npt.ArrayLike) -> None:
-        """Append samples (n, ch) with timestamps t (n,) to the stream of this rate."""
+        """Append samples (n, ch) with timestamps t (n,) to the stream of this rate.
+
+        Samples are converted to the stream's dtype: for an integer dtype,
+        floating input is `rint((x - offset) / scale)` and must fit the type
+        (ValueError on overflow, naming the channel), integer input is stored
+        as the counts given; a floating dtype casts.
+        """
         if self._f is None:
             raise RuntimeError("Writer is closed")
         st = self._streams[_find_rate(self.rates, float(rate))]
         t = np.asarray(t, dtype=np.float64).ravel()
-        samples = np.asarray(samples, dtype=np.float64)
+        samples = np.asarray(samples)
         if samples.ndim == 1 and len(st.names) == 1:
             samples = samples.reshape(-1, 1)
         n = len(t)
@@ -1287,6 +1562,7 @@ class Writer:
             return
         if samples.shape != (n, len(st.names)):
             raise ValueError(f"samples has shape {samples.shape}; expected ({n}, {len(st.names)})")
+        samples = to_storage(samples, st.dtype, st.scale, st.offset, st.names)
         tt = t if st.t_last is None else np.concatenate([[st.t_last], t])
         dt = np.diff(tt)
         if np.any(dt <= 0):
@@ -1378,5 +1654,6 @@ def write(file_path: str | os.PathLike, streams: Sequence[Stream], *,
                 t_offset_scale=t_offset_scale, t_units=t_units, hdr=hdr,
                 compress=compress) as w:
         for s in streams:
-            w.add_stream(s.rate, s.channel_names, s.units, is_regular=s.is_regular)
+            w.add_stream(s.rate, s.channel_names, s.units, is_regular=s.is_regular,
+                         dtype=s.dtype, scale=s.scale, offset=s.offset)
             w.append(s.rate, s.t, s.samples)

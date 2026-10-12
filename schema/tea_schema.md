@@ -22,7 +22,7 @@ These must exist for a file to be a valid TEA file.
 | Variable | Type | Shape | Description |
 |----------|------|-------|-------------|
 | `t` | numeric | `[N × 1]` | Timestamp per sample. Must be monotonically increasing. Units defined by `t_units`; unitless if `t_units` is absent |
-| `Samples` | any numeric | `[N × C]` | Data matrix — N time samples, C channels |
+| `Samples` | `double`, `single`, `int16`, `int32` or `int64` | `[N × C]` | Data matrix — N time samples, C channels. The reference writers store one of these five classes (readers accept any numeric class). Integer samples are counts, physical when `scale` is present (see [Storage class and scaling](#storage-class-and-scaling)) |
 | `SR` | double | scalar or `[]` | Effective sample rate in samples per `t_units`. When `t_units = 's'`, this equals Hz. When `t_units = 'us'`, this is samples/μs (e.g., 0.03 for 30 kHz). **Can be empty when `isRegular = false`** |
 | `isRegular` | logical | scalar | `true` if samples are regularly spaced (constant `dt` between consecutive samples within continuous segments) |
 
@@ -47,12 +47,32 @@ Derivable from required variables. They accelerate read performance and provide 
 | `t_offset_units` | char | string | Units of `t_offset` (e.g., `'posix_s'`, `'posix_us'`). Required when `t_offset` is present |
 | `t_offset_scale` | double | scalar | Conversion factor from `t_offset` units to `t` units. Defaults to `1.0` when `t_offset_units == t_units`. Required when they differ |
 | `ch_map` | double | `[1 × C]` | Channel identity vector mapping columns of `Samples` to source channel numbers. Defaults to `1:C` if absent |
+| `scale` | double | `[1 × C]` | Per-channel factor from integer counts to physical values (`physical = double(Samples) .* scale + offset`). Only with an integer `Samples` class |
+| `offset` | double | `[1 × C]` | Per-channel offset added after scaling. May be absent when `scale` is present (then 0) |
 | `SR_original` | double | scalar | Original sample rate before decimation (equals `SR` if undecimated) |
 | `hdr` | struct | free-form | Source-specific metadata |
 | `tea_version` | char | string | Format version (e.g., `'1.0'`; `'2.0'` in version-2 files) |
 | `schema_version` | double | scalar | Schema version; absent means 1. Version-2 files store `2` |
 
 Any additional user-defined variables may be stored alongside these.
+
+---
+
+## Storage class and scaling
+
+`Samples` is stored as one of `double`, `single`, `int16`, `int32` or `int64` (doc version 2.1; before it the class was "any numeric", and every reference writer stored `double`). Integer classes hold **counts**, typically the ADC values of the source; `single` and `double` hold physical values.
+
+An integer stream may carry per-stream `scale` and `offset` datasets (`[1 × C]` double, one value per column of `Samples`):
+
+```
+physical = double(Samples) .* scale + offset
+```
+
+- `offset` may be absent when `scale` is present; it is then 0. `scale` and `offset` are never present with a floating `Samples` class: writers refuse that, readers ignore the pair with a warning.
+- `units` (schema 2) and `hdr.units`, where used, name the **physical** unit, i.e. the unit after scaling.
+- Writers given physical (floating) values for an integer class store `round((x - offset) / scale)` and refuse values that do not fit the class; integer input is stored as the counts given.
+- Readers: with `scale`, `read` returns physical values as `double` by default; a `dtype` option gives `single` or the stored counts (`'int'`). Without `scale`, `read` returns `Samples` as stored, whatever its class (a `dtype` option still casts on request; asking for counts from a floating stream is an error).
+- The chunk rule (next section) uses the bytes per sample of the stored class, so integer streams have proportionally more samples per chunk.
 
 ---
 
@@ -152,12 +172,14 @@ A recording may hold channels at different sample rates (e.g. 256 Hz EEG and 102
 /rates                   struct group, one subgroup per stream
 /rates/r1                struct group: first stream
     t                    [N1 × 1]  double   timestamps, strictly increasing, gaps allowed
-    Samples              [N1 × C1] double
+    Samples              [N1 × C1] double | single | int16 | int32 | int64
     SR                   scalar             sample rate of this stream
     isRegular            logical
     t_coarse, df_t_coarse, isContinuous, cont, disc   (as in version 1, for this stream)
     channel_names        [C1 × L] char      one row per channel, space padded
-    units                [C1 × L] char      one row per channel (e.g. 'uV'), space padded
+    units                [C1 × L] char      one row per channel (e.g. 'uV'), space padded;
+                                            the physical unit, after scaling
+    scale, offset        [1 × C1] double    optional, integer Samples only (see Storage class and scaling)
 /rates/r2                second stream, same fields
 ...
 ```
@@ -170,14 +192,14 @@ A recording may hold channels at different sample rates (e.g. 256 Hz EEG and 102
 
 ### One stream: version-1 compatible
 
-When the file has exactly one stream, the top level also has `t`, `Samples`, `SR`, `isRegular`, `t_coarse`, `df_t_coarse`, `isContinuous` and (when there are gaps) `cont`, `disc`. These are HDF5 hard links to the datasets in `/rates/r1`, so the samples are stored once. Version-1 readers (MATLAB and Python `TEA` from before version 2) read such a file unchanged.
+When the file has exactly one stream, the top level also has `t`, `Samples`, `SR`, `isRegular`, `t_coarse`, `df_t_coarse`, `isContinuous`, (when there are gaps) `cont`, `disc` and (for a scaled integer stream) `scale`, `offset`. These are HDF5 hard links to the datasets in `/rates/r1`, so the samples are stored once. Version-1 readers (MATLAB and Python `TEA` from before version 2) read such a file unchanged; a version-1 reader that knows `scale` applies it, an older one returns the counts.
 
 With more than one stream there are no top-level `t`, `Samples`, `SR` or `isRegular`; a version-1 reader cannot read the file and must use a version-2 reader.
 
 ### Readers and writers
 
-- Python: `tea.write(path, [tea.Stream(rate, channel_names, units, samples, t), ...], t_offset=...)` or `tea.Writer` for writing in blocks; `tea.read(path)` opens version 1 or 2 and gives `.rates` and `.stream(rate)`.
-- MATLAB: `tea = TEA(path, rate, true)` with any rate in the file; `tea.rates`, `tea.stream(rate).read(channels, t_range, s_range)`. A version-1 file is one stream (its group is `/`).
+- Python: `tea.write(path, [tea.Stream(rate, channel_names, units, samples, t, dtype=..., scale=..., offset=...), ...], t_offset=...)` or `tea.Writer` (`add_stream(rate, names, units, dtype=..., scale=..., offset=...)`) for writing in blocks; `tea.read(path)` opens version 1 or 2 and gives `.rates`, `.stream(rate)` and `.channel_scales`; `stream.read(..., dtype=None | 'single' | 'double' | 'int')`.
+- MATLAB: `tea = TEA(path, rate, true)` with any rate in the file; `tea.rates`, `tea.stream(rate).read(channels, t_range, s_range, 'DataType', ...)`. A version-1 file is one stream (its group is `/`).
 - The version-1 write methods (`TEA.write`, `write_channels`, `refresh`) refuse version-2 files.
 
 ---
@@ -188,3 +210,4 @@ With more than one stream there are no top-level `t`, `Samples`, `SR` or `isRegu
 |---------|------|--------|
 | 1 | | One time axis per file. |
 | 2 | 2026-10-11 | Several sample rates per file, one group per rate under `/rates`; top-level `schema_version`, `channel_names`, `channel_rates`. One-stream files keep the version-1 fields. |
+| 2.1 (doc) | 2026-10-11 | Storage classes named (`double`, `single`, `int16`, `int32`, `int64`); optional per-stream `scale` and `offset` for integer counts (`physical = double(Samples) .* scale + offset`), linked at the top level of a one-stream file like the other version-1 fields; regularity rule stated (`0.9/SR <= dt <= 1.1/SR` within a segment). `schema_version` stays 2. |

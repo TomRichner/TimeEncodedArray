@@ -326,3 +326,156 @@ class TestWriterErrors:
         tea.write(path, two_rate_streams())
         with pytest.raises(RuntimeError, match='read-only'):
             tea.read(path).stream(256).write(np.arange(3.0) + 10, np.zeros((3, 3)))
+
+
+# ============ Storage classes, scale and offset ============
+
+class TestStorageClasses:
+    def test_int32_scaled_round_trip(self, path):
+        rate, n = 500.0, 2000
+        t = regular_t(rate, n)
+        x = np.random.randn(n, 3) * 100   # physical uV
+        scale = [0.1, 0.5, 0.01]
+        offset = [0.0, -2.0, 1.5]
+        tea.write(path, [Stream(rate, ['a', 'b', 'c'], 'uV', x, t, dtype=np.int32,
+                                scale=scale, offset=offset)])
+        with h5py.File(path, 'r') as h:
+            ds = h['rates/r1/Samples']
+            assert ds.dtype == np.int32
+            assert ds.attrs['MATLAB_class'] == b'int32'
+            assert ds.chunks == (3, tea.chunk_samples(3, np.int32))
+            np.testing.assert_array_equal(h['rates/r1/scale'][()].ravel(), scale)
+            np.testing.assert_array_equal(h['rates/r1/offset'][()].ravel(), offset)
+            assert h['rates/r1/scale'].shape == (3, 1)  # MATLAB [1 x C]
+            # One stream: scale and offset linked at the top level too
+            assert h['scale'] == h['rates/r1/scale'] and h['offset'] == h['rates/r1/offset']
+            counts = ds[()].T
+
+        s = tea.read(path).stream(rate)
+        assert s.dtype == np.int32
+        np.testing.assert_array_equal(s.scale, scale)
+        np.testing.assert_array_equal(s.offset, offset)
+        assert tea.read(path).channel_scales == scale
+        # Physical double by default, within half a count
+        data, _, _ = s.read()
+        assert data.dtype == np.float64
+        assert np.all(np.abs(data - x) <= np.array(scale) / 2 + 1e-12)
+        np.testing.assert_allclose(data, counts * np.array(scale) + np.array(offset))
+        # Single on request, same values
+        d32, _, _ = s.read(dtype=np.float32)
+        assert d32.dtype == np.float32
+        np.testing.assert_allclose(d32, data, rtol=1e-6)
+        # Counts on request, channel subset by name and number, out of order
+        dc, _, _ = s.read(channels=['c', 1], dtype='int', s_range=(10, 19))
+        assert dc.dtype == np.int32
+        np.testing.assert_array_equal(dc, counts[10:20][:, [2, 0]])
+        dp, _, _ = s.read(channels=['c', 1], s_range=(10, 19))
+        np.testing.assert_allclose(dp, data[10:20][:, [2, 0]])
+        info = s.info()
+        assert info['dtype'] == 'int32' and info['scaled'] is True
+
+    def test_counts_input_stored_as_given(self, path):
+        t = regular_t(100, 50)
+        counts = np.arange(-25, 25, dtype=np.int32).reshape(50, 1) * 1000
+        tea.write(path, [Stream(100, ['a'], 'uV', counts, t, dtype=np.int32, scale=0.25)])
+        s = tea.read(path).stream()
+        dc, _, _ = s.read(dtype='int')
+        np.testing.assert_array_equal(dc, counts)
+        np.testing.assert_array_equal(s.offset, [0.0])  # offset defaults to 0
+        d, _, _ = s.read()
+        np.testing.assert_array_equal(d, counts * 0.25)
+        # int16 counts into an int32 stream are widened, int32 into int16 are checked
+        p2 = path.replace('.mat', '_2.mat')
+        tea.write(p2, [Stream(100, ['a'], 'uV', counts.astype(np.int16) // 1000, t, dtype=np.int32)])
+        np.testing.assert_array_equal(tea.read(p2).stream().read()[0], counts // 1000)
+        with pytest.raises(ValueError, match='int16'):
+            tea.write(p2, [Stream(100, ['a'], 'uV', counts * 100, t, dtype=np.int16)])
+
+    def test_int_without_scale_reads_as_stored(self, path):
+        t = regular_t(100, 30)
+        counts = np.arange(30, dtype=np.int16).reshape(30, 1)
+        tea.write(path, [Stream(100, ['a'], 'counts', counts, t, dtype=np.int16)])
+        s = tea.read(path).stream()
+        assert s.scale is None and s.offset is None
+        d, _, _ = s.read()
+        assert d.dtype == np.int16
+        np.testing.assert_array_equal(d, counts)
+        d, _, _ = s.read(dtype=np.float64)
+        assert d.dtype == np.float64
+        assert s.info()['scaled'] is False
+        assert tea.read(path).channel_scales == [None]
+
+    def test_float32_stream(self, path):
+        t = regular_t(256, 512)
+        x = np.random.randn(512, 2)
+        tea.write(path, [Stream(256, ['a', 'b'], 'uV', x, t, dtype=np.float32)])
+        with h5py.File(path, 'r') as h:
+            assert h['rates/r1/Samples'].dtype == np.float32
+            assert h['rates/r1/Samples'].attrs['MATLAB_class'] == b'single'
+            assert 'scale' not in h['rates/r1']
+        s = tea.read(path).stream()
+        assert s.dtype == np.float32
+        d, _, _ = s.read()
+        assert d.dtype == np.float32
+        np.testing.assert_array_equal(d, x.astype(np.float32))
+        d64, _, _ = s.read(dtype='double')
+        assert d64.dtype == np.float64
+        with pytest.raises(ValueError, match='not integer counts'):
+            s.read(dtype='int')
+
+    def test_overflow_and_scale_with_float_dtype(self, path):
+        t = regular_t(100, 10)
+        with pytest.raises(ValueError, match='Fp2'):
+            tea.write(path, [Stream(100, ['Fp1', 'Fp2'], 'uV',
+                                    np.column_stack([np.zeros(10), np.full(10, 40000.0)]), t,
+                                    dtype=np.int16, scale=1.0)])
+        with pytest.raises(ValueError, match='integer dtype'):
+            tea.write(path, [Stream(100, ['a'], 'uV', np.zeros((10, 1)), t,
+                                    dtype=np.float32, scale=0.1)])
+        with pytest.raises(ValueError, match='storage class'):
+            tea.write(path, [Stream(100, ['a'], 'uV', np.zeros((10, 1)), t, dtype=np.uint8)])
+        with pytest.raises(ValueError, match='fit int32'):
+            tea.write(path, [Stream(100, ['a'], 'uV', np.full((10, 1), np.nan), t, dtype=np.int32)])
+
+    def test_one_rate_int_file_reads_physical_through_tea_class(self, path):
+        t = regular_t(200, 400)
+        x = np.random.randn(400, 2) * 10
+        tea.write(path, [Stream(200, ['a', 'b'], 'uV', x, t, dtype=np.int32,
+                                scale=[0.01, 0.02], offset=[1.0, 0.0])])
+        v1 = TEA(path, 200, True)
+        assert v1.dtype == np.int32
+        np.testing.assert_array_equal(v1.scale, [0.01, 0.02])
+        data, _, _ = v1.read()
+        assert data.dtype == np.float64
+        assert np.all(np.abs(data - x) <= 0.01 + 1e-12)
+        counts, _, _ = v1.read(channels=[2], dtype='int')
+        assert counts.dtype == np.int32
+        np.testing.assert_allclose(counts[:, 0] * 0.02, data[:, 1])
+        assert v1.info()['dtype'] == 'int32' and v1.info()['scaled'] is True
+        with pytest.raises(ValueError, match='dtype mismatch'):
+            TEA(path, 200, True, dtype=np.float64)
+
+    def test_mixed_dtypes_in_one_file(self, path):
+        t_a, t_b, t_c = regular_t(256, 256), regular_t(1024, 1024), regular_t(10, 10)
+        x_a = np.random.randn(256, 2) * 50
+        x_b = np.random.randn(1024, 1)
+        x_c = np.random.randn(10, 1)
+        with tea.Writer(path, t_offset=T_OFFSET, compress=True) as w:
+            w.add_stream(256, ['E1', 'E2'], 'uV', dtype='int32', scale=0.05)
+            w.add_stream(1024, ['DC'], 'mV', dtype=np.float32)
+            w.add_stream(10, ['slow'], 'au')
+            w.append(256, t_a, x_a)
+            w.append(1024, t_b, x_b)
+            w.append(10, t_c, x_c)
+        f = tea.read(path)
+        assert [s.dtype for s in f.streams] == [np.int32, np.float32, np.float64]
+        assert f.channel_scales == [0.05, 0.05, None, None]
+        da, _, _ = f.stream(256).read()
+        assert da.dtype == np.float64 and np.all(np.abs(da - x_a) <= 0.025 + 1e-12)
+        db, _, _ = f.stream(1024).read()
+        assert db.dtype == np.float32
+        dc, _, _ = f.stream(10).read()
+        np.testing.assert_array_equal(dc, x_c)
+        with h5py.File(path, 'r') as h:
+            assert h['rates/r1/Samples'].compression == 'gzip'
+            assert 'scale' not in h  # several streams: nothing linked at the top
