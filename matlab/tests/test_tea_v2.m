@@ -182,7 +182,10 @@ classdef test_tea_v2 < matlab.unittest.TestCase
             f = tc.v2file('v2_two_rates_compressed.mat');
             [t256, x256, t1024, x1024] = test_tea_v2.two_rate_data();
             info = h5info(f, '/rates/r2/Samples');
-            tc.verifyEqual(info.ChunkSize, [500 2]);
+            tc.verifyEqual(info.ChunkSize, [TEA.chunk_samples(2, 'double') 2]);
+            tc.verifyEqual(TEA.chunk_samples(2, 'double'), 8192);
+            tc.verifyEqual(TEA.chunk_samples(276, 'double'), 237);
+            tc.verifyEqual(TEA.chunk_samples(276, 'int32'), 474);
             names = {info.Filters.Name};
             tc.verifyTrue(any(strcmpi(names, 'deflate')));
             tc.verifyFalse(any(strcmpi(names, 'shuffle')));

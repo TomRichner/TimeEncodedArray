@@ -32,11 +32,30 @@ logger = logging.getLogger(__name__)
 # Type aliases
 ArrayFloat64 = npt.NDArray[np.float64]
 
-# Samples per HDF5 chunk; a chunk spans all channels. Short chunks keep
-# partial reads cheap: with 276 channels a chunk is about 1 MB, so reading a
-# one-second window from a compressed file decompresses a megabyte or two
-# rather than a 70 MB chunk (measured 30x faster than 32000, same file size).
-CHUNK_SAMPLES = 500
+# HDF5 chunking: a chunk spans all channels and about CHUNK_BYTES of samples.
+# Chunks of this size keep partial reads cheap (a one-second window from a
+# compressed file decompresses a megabyte or less, not a 70 MB chunk; measured
+# 30x faster than 32000-sample chunks at 276 channels, same file size) while
+# staying under HDF5's 1 MB default chunk cache. The sample count is derived
+# from the channel count and dtype, bounded so that a one-channel stream does
+# not get thousands of tiny chunks and a very wide one does not exceed the
+# cache. The MATLAB class uses the same rule. Cost: HDF5 stores the last,
+# partial chunk of a dataset at full size, so an uncompressed file carries up
+# to CHUNK_BYTES (Samples) plus 64 KB (t) of padding; it compresses away.
+CHUNK_BYTES = 512 * 1024
+CHUNK_SAMPLES_MIN = 64
+CHUNK_SAMPLES_MAX = 8192
+
+
+def chunk_samples(n_channels: int, dtype=np.float64, target_bytes: int = CHUNK_BYTES) -> int:
+    """Samples per HDF5 chunk for `n_channels` of `dtype`, about `target_bytes` per chunk.
+
+    276 float64 channels give 237 samples (about 512 KB); 46 give 1424; one
+    channel gives the 8192 cap (64 KB).
+    """
+    itemsize = np.dtype(dtype).itemsize
+    per_sample = max(1, int(n_channels)) * itemsize
+    return int(min(CHUNK_SAMPLES_MAX, max(CHUNK_SAMPLES_MIN, target_bytes // per_sample)))
 
 # Highest schema version this module writes and reads.
 SCHEMA_VERSION = 2
@@ -529,8 +548,9 @@ class TEA:
         # Determine allocation sizes
         N_alloc = max(N, self._expected_length or N)
         C_alloc = max(C, self._expected_channels or C)
-        chunk_n = min(CHUNK_SAMPLES, max(1, N_alloc))
         chunk_c = max(1, C_alloc)
+        chunk_n = min(chunk_samples(chunk_c), max(1, N_alloc))
+        chunk_t = min(chunk_samples(1), max(1, N_alloc))
 
         # Compression kwargs for t and Samples datasets
         # No shuffle filter: sampled data is usually integer ADC counts times a
@@ -554,7 +574,7 @@ class TEA:
             self._write_h5_scalar(f, 'isRegular', self._is_regular, logical=True)
             # t: HDF5 (1, N_alloc), write first N values
             ds_t = f.create_dataset('t', shape=(1, N_alloc),
-                             maxshape=(1, None), chunks=(1, chunk_n),
+                             maxshape=(1, None), chunks=(1, chunk_t),
                              dtype=np.float64, **comp_kwargs)
             ds_t.attrs['MATLAB_class'] = np.bytes_('double')
             ds_t[0, :N] = t
@@ -1313,10 +1333,10 @@ class Writer:
         g = self._f[RATES_GROUP].create_group(f'r{len(self._streams) + 1}')
         g.attrs['MATLAB_class'] = np.bytes_('struct')
         ds_t = g.create_dataset('t', shape=(1, 0), maxshape=(1, None),
-                                chunks=(1, CHUNK_SAMPLES), dtype=np.float64, **self._comp)
+                                chunks=(1, chunk_samples(1)), dtype=np.float64, **self._comp)
         ds_t.attrs['MATLAB_class'] = np.bytes_('double')
         ds_s = g.create_dataset('Samples', shape=(C, 0), maxshape=(C, None),
-                                chunks=(C, CHUNK_SAMPLES), dtype=np.float64, **self._comp)
+                                chunks=(C, chunk_samples(C)), dtype=np.float64, **self._comp)
         ds_s.attrs['MATLAB_class'] = np.bytes_('double')
         TEA._write_h5_scalar(g, 'SR', rate)
         TEA._write_h5_scalar(g, 'isRegular', is_regular, logical=True)

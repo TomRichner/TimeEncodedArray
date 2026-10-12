@@ -182,8 +182,11 @@ class TestV2RoundTrip:
                 assert h[name] == h['rates/r1/' + name], name
             np.testing.assert_array_equal(h['t_offset'][()].ravel(), [T_OFFSET])
 
-        # Data stored once: the file is not twice the size of the samples
-        assert os.path.getsize(path) < 1.5 * x.nbytes + 100_000
+        # Data stored once: the file is not twice the size of the samples. The
+        # last chunk of each dataset is stored at full size (uncompressed), so
+        # allow one Samples chunk and one t chunk of padding.
+        padding = 8 * (4 * tea.chunk_samples(4) + tea.chunk_samples(1))
+        assert os.path.getsize(path) < 1.5 * x.nbytes + padding + 100_000
 
         with pytest.raises(RuntimeError, match='version-2'):
             v1.write(t[-1] + 1 + np.arange(3) / 200, np.zeros((3, 4)))
@@ -221,14 +224,14 @@ class TestChunkedReads:
         with h5py.File(path, 'r') as h:
             for k, C in (('r1', 6), ('r2', 2)):
                 ds = h[f'rates/{k}/Samples']
-                assert ds.chunks == (C, tea.CHUNK_SAMPLES)
+                assert ds.chunks == (C, tea.chunk_samples(C))
                 assert ds.compression == 'gzip' and ds.compression_opts == 1
                 assert ds.shuffle is False
-                assert h[f'rates/{k}/t'].chunks == (1, tea.CHUNK_SAMPLES)
+                assert h[f'rates/{k}/t'].chunks == (1, tea.chunk_samples(1))
 
         f = tea.read(path)
         a, b = f.stream(rate_a), f.stream(rate_b)
-        # Sample range across chunk boundaries (499/500, 999/1000)
+        # Sample range spanning several appended blocks (333 samples each)
         data, t_out, _ = a.read(s_range=(480, 1020))
         np.testing.assert_array_equal(data, x_a[480:1021])
         np.testing.assert_array_equal(t_out, t_a[480:1021])
@@ -246,6 +249,45 @@ class TestChunkedReads:
         tea.write(path, two_rate_streams())
         with h5py.File(path, 'r') as h:
             assert h['rates/r1/Samples'].compression is None
+
+    def test_chunk_samples_targets_512_kb_per_chunk(self):
+        assert tea.chunk_samples(276) == 237            # 276 x 8 x 237 = 523 KB
+        assert tea.chunk_samples(276, np.int32) == 474
+        assert tea.chunk_samples(276, np.float32) == 474
+        assert tea.chunk_samples(46) == 1424
+        assert tea.chunk_samples(1) == tea.CHUNK_SAMPLES_MAX
+        assert tea.chunk_samples(100_000) == tea.CHUNK_SAMPLES_MIN
+        for c in (1, 4, 46, 276, 1024):
+            assert c * 8 * tea.chunk_samples(c) <= 1024 * 1024 or c * 8 * tea.CHUNK_SAMPLES_MIN > 1024 * 1024
+
+    def test_wide_stream_reads_across_chunk_boundaries(self, path):
+        # 300 channels: 218 samples per chunk, so a 2000-sample stream has
+        # nine chunks and the reads below cross several boundaries.
+        rate, n, C = 1000.0, 2000, 300
+        t = regular_t(rate, n)
+        x = np.random.randn(n, C)
+        with tea.Writer(path, t_offset=T_OFFSET, compress=True) as w:
+            w.add_stream(rate, [f'E{i}' for i in range(C)], 'uV')
+            for lo in range(0, n, 700):
+                w.append(rate, t[lo:lo + 700], x[lo:lo + 700])
+        with h5py.File(path, 'r') as h:
+            assert h['rates/r1/Samples'].chunks == (C, 218)
+            assert h['rates/r1/t'].chunks == (1, 8192)
+        s = tea.read(path).stream(rate)
+        data, t_out, _ = s.read(s_range=(200, 1300))
+        np.testing.assert_array_equal(data, x[200:1301])
+        np.testing.assert_array_equal(t_out, t[200:1301])
+        data, t_out, _ = s.read(channels=['E299', 'E0'], t_range=(0.43, 0.44))
+        sel = (t >= 0.43) & (t <= 0.44)
+        np.testing.assert_array_equal(data, x[sel][:, [299, 0]])
+        # The schema-1 class follows the same rule, capped at the allocation
+        p1 = path.replace('.mat', '_v1.mat')
+        tea.TEA(p1, rate, True, t_units='s').write(t, x)
+        with h5py.File(p1, 'r') as h:
+            assert h['Samples'].chunks == (C, 218)
+            assert h['t'].chunks == (1, min(8192, n))
+        d1, t1, _ = tea.TEA(p1, rate, True).read(s_range=(210, 1290))
+        np.testing.assert_array_equal(d1, x[210:1291])
 
 
 # ============ Writer validation ============

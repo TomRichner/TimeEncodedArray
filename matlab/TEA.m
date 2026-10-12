@@ -982,6 +982,34 @@ classdef TEA < handle
 
 
     %% ============ STATIC METHODS ============
+    methods (Static)
+
+        function n = chunk_samples(n_channels, var_class)
+        % CHUNK_SAMPLES Samples per HDF5 chunk for n_channels of a class.
+        %   A chunk spans all channels and holds about 512 KB; the count is
+        %   bounded to [64, 8192] so one channel does not get thousands of
+        %   tiny chunks and a very wide stream stays under HDF5's 1 MB
+        %   chunk cache. 276 double channels give 237; 46 give 1424; one
+        %   channel gives 8192. Same rule as python/tea.py chunk_samples.
+            if nargin < 2, var_class = 'double'; end
+            switch lower(var_class)
+                case {'double', 'int64', 'uint64'}
+                    itemsize = 8;
+                case {'single', 'int32', 'uint32'}
+                    itemsize = 4;
+                case {'int16', 'uint16'}
+                    itemsize = 2;
+                case {'int8', 'uint8', 'logical'}
+                    itemsize = 1;
+                otherwise
+                    itemsize = 8;
+            end
+            target_bytes = 512 * 1024;
+            per_sample = max(1, n_channels) * itemsize;
+            n = min(8192, max(64, floor(target_bytes / per_sample)));
+        end
+    end
+
     methods (Static, Access = private)
 
         function h5_init_dataset(filename, var, sz, var_class, do_compress)
@@ -1000,12 +1028,11 @@ classdef TEA < handle
             end
 
             varname = ['/' var];
-            % Samples per HDF5 chunk; a chunk spans all channels. Short chunks
-            % keep partial reads cheap: with 276 channels a chunk is about
-            % 1 MB, so reading a one-second window from a compressed file
-            % decompresses a megabyte or two rather than a 70 MB chunk.
-            chunk_rows = min(500, max(1, sz(1)));
+            % A chunk spans all channels and holds about 512 KB of samples
+            % (TEA.chunk_samples, same rule as the Python module): partial
+            % reads stay cheap and a chunk fits HDF5's 1 MB chunk cache.
             chunk_cols = max(1, sz(2));
+            chunk_rows = min(TEA.chunk_samples(chunk_cols, var_class), max(1, sz(1)));
             if do_compress
                 deflate_level = 1;
             else

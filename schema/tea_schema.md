@@ -125,7 +125,7 @@ Writers SHOULD warn when `ULP(t[0]) / median(diff(t)) > 0.01` (1%), indicating t
 
 ## File Format
 
-TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The reference implementations use chunks of 500 samples spanning all channels (`[500, C]` as MATLAB sees it), which keeps short time-window reads cheap. When compressed, they use DEFLATE (gzip) level 1 without the shuffle filter. Both apply to every stream of a version-2 file.
+TEA files are HDF5 files saved with MATLAB's `-v7.3` flag (or equivalent HDF5 writers in other languages). Large arrays (`t`, `Samples`) should use chunked storage for efficient partial reads. The reference implementations use chunks spanning all channels and holding about 512 KB of samples (`[n, C]` as MATLAB sees it, with `n = clamp(floor(512 KiB / (C × bytes per sample)), 64, 8192)`; 237 samples for 276 `double` channels, 8192 for one channel), which keeps short time-window reads cheap and a chunk within HDF5's default 1 MB chunk cache. `t` is chunked as a one-channel stream (8192 samples). HDF5 stores the last, partial chunk of a dataset at full size, so an uncompressed file carries up to about 512 KB plus 64 KB of padding; compression removes it. When compressed, they use DEFLATE (gzip) level 1 without the shuffle filter. Both apply to every stream of a version-2 file.
 
 Shapes in this document are as MATLAB sees them; HDF5 stores the transpose (e.g. `Samples` `[N × C]` is the HDF5 dataset `(C, N)`).
 
