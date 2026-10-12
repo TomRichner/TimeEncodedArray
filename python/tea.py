@@ -88,6 +88,23 @@ _DTYPE_ALIASES = {'double': np.float64, 'single': np.float32}
 # =====================================================================
 
 
+def compression_kwargs(compress: bool, dtype=np.float64) -> dict:
+    """h5py filter arguments for a `t` or `Samples` dataset.
+
+    DEFLATE level 1 when `compress`. The byte-shuffle filter is used for the
+    integer classes only: on int32 EEG counts it gave files 25-28 % smaller
+    and faster writes and reads (276 channels, 492 s: 103 MB vs 138 MB, read
+    0.9 s vs 1.6 s), while on float64 physical values it hides the repeated
+    8-byte patterns DEFLATE finds (438 MB vs 273 MB on the same clip).
+    """
+    if not compress:
+        return {}
+    kw = {'compression': 'gzip', 'compression_opts': 1}
+    if np.issubdtype(np.dtype(dtype), np.integer):
+        kw['shuffle'] = True
+    return kw
+
+
 def storage_dtype(dtype) -> np.dtype:
     """The numpy dtype of a storage class (`np.int32`, `'int32'`, `'single'`, ...)."""
     if isinstance(dtype, str) and dtype in _DTYPE_ALIASES:
@@ -931,14 +948,9 @@ class TEA:
         chunk_n = min(chunk_samples(chunk_c, self._dtype), max(1, N_alloc))
         chunk_t = min(chunk_samples(1), max(1, N_alloc))
 
-        # Compression kwargs for t and Samples datasets
-        # No shuffle filter: sampled data is usually integer ADC counts times a
-        # scale factor, so whole 8-byte values repeat and DEFLATE finds them.
-        # Shuffle splits those values into byte lanes and hides the repeats
-        # (measured on EEG: 2.4x larger files and slower with shuffle).
-        comp_kwargs = {}
-        if self._compress:
-            comp_kwargs = {'compression': 'gzip', 'compression_opts': 1}
+        # Filters: DEFLATE 1 when compressed; shuffle for integer classes only
+        comp_kwargs = compression_kwargs(self._compress)
+        comp_samples = compression_kwargs(self._compress, self._dtype)
 
         # Create HDF5 file with 512-byte userblock for MATLAB v7.3 compatibility
         with h5py.File(self._file_path, 'w', userblock_size=512) as f:
@@ -960,7 +972,7 @@ class TEA:
             # Samples: HDF5 (C_alloc, N_alloc), write first (C, N) values
             ds_s = f.create_dataset('Samples', shape=(C_alloc, N_alloc),
                                     maxshape=(None, None), chunks=(chunk_c, chunk_n),
-                                    dtype=self._dtype, **comp_kwargs)
+                                    dtype=self._dtype, **comp_samples)
             ds_s.attrs['MATLAB_class'] = np.bytes_(STORAGE_CLASSES[self._dtype])
             ds_s[:C, :N] = samples.T
             # String metadata
@@ -1478,7 +1490,7 @@ class Writer:
         self._t_offset_scale = float(t_offset_scale)
         self._t_units = t_units
         self._hdr = hdr or {}
-        self._comp = {'compression': 'gzip', 'compression_opts': 1} if compress else {}
+        self._compress = bool(compress)
         self._streams: list[_StreamState] = []
         self._f: h5py.File | None = h5py.File(self.file_path, 'w', userblock_size=512)
         rates = self._f.create_group(RATES_GROUP)
@@ -1529,10 +1541,12 @@ class Writer:
         g = self._f[RATES_GROUP].create_group(f'r{len(self._streams) + 1}')
         g.attrs['MATLAB_class'] = np.bytes_('struct')
         ds_t = g.create_dataset('t', shape=(1, 0), maxshape=(1, None),
-                                chunks=(1, chunk_samples(1)), dtype=np.float64, **self._comp)
+                                chunks=(1, chunk_samples(1)), dtype=np.float64,
+                                **compression_kwargs(self._compress))
         ds_t.attrs['MATLAB_class'] = np.bytes_('double')
         ds_s = g.create_dataset('Samples', shape=(C, 0), maxshape=(C, None),
-                                chunks=(C, chunk_samples(C, dtype)), dtype=dtype, **self._comp)
+                                chunks=(C, chunk_samples(C, dtype)), dtype=dtype,
+                                **compression_kwargs(self._compress, dtype))
         ds_s.attrs['MATLAB_class'] = np.bytes_(STORAGE_CLASSES[dtype])
         write_scalar(g, 'SR', rate)
         write_scalar(g, 'isRegular', is_regular, logical=True)

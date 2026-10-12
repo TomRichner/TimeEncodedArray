@@ -794,10 +794,15 @@ class TestStorageClass:
 
         g = mat_path(temp_dir, 'int16')
         counts = (np.random.randn(100, 2) * 1000).astype(np.int16)
-        TEA(g, 100, True, dtype=np.int16).write(t, counts)
+        TEA(g, 100, True, dtype=np.int16, compress=True).write(t, counts)
         Data, _, _ = TEA(g, 100, True).read()
         assert Data.dtype == np.int16
         np.testing.assert_array_equal(Data, counts)
+        import h5py
+        with h5py.File(g, 'r') as hf:
+            # Compressed integer counts use the shuffle filter; t (double) does not
+            assert hf['Samples'].compression == 'gzip' and hf['Samples'].shuffle is True
+            assert hf['t'].compression == 'gzip' and hf['t'].shuffle is False
 
 
 # ============ Test: Pre-allocation ============

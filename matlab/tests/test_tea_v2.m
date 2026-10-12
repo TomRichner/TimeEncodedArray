@@ -290,9 +290,14 @@ classdef test_tea_v2 < matlab.unittest.TestCase
             tc.verifyClass(S.Samples, 'int32');
             tc.verifyEqual(S.scale, scale);
             tc.verifyEqual(S.rates.r1.offset, offset);
-            % Compressed int32: chunk rule uses 4 bytes per sample
+            % Compressed int32: chunk rule uses 4 bytes per sample; shuffle on
             info = h5info(f, '/rates/r1/Samples');
             tc.verifyEqual(info.ChunkSize, [TEA.chunk_samples(2, 'int32') 2]);
+            names = {info.Filters.Name};
+            tc.verifyTrue(any(strcmpi(names, 'deflate')));
+            tc.verifyTrue(any(strcmpi(names, 'shuffle')));
+            names_t = {h5info(f, '/rates/r1/t').Filters.Name};
+            tc.verifyFalse(any(strcmpi(names_t, 'shuffle')));
         end
 
         %% single-precision stream reads back as single, double on request

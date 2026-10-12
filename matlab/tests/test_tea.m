@@ -773,9 +773,14 @@ classdef test_tea < matlab.unittest.TestCase
             tc.verifyEqual(tea3.read(), 0.5 * ones(N, 3));
             tc.verifyEqual(TEA(g, SR, true).info().dtype, 'int16');
 
-            % Without scale an integer file reads as stored, double on request
+            % Without scale an integer file reads as stored, double on request;
+            % compressed integer counts use the shuffle filter (t does not)
             h = fullfile(tc.temp_dir, 'raw.mat');
-            TEA(h, SR, true).write(t, counts);
+            TEA(h, SR, true, 'compress', true).write(t, counts);
+            names = {h5info(h, '/Samples').Filters.Name};
+            tc.verifyTrue(any(strcmpi(names, 'deflate')));
+            tc.verifyTrue(any(strcmpi(names, 'shuffle')));
+            tc.verifyFalse(any(strcmpi({h5info(h, '/t').Filters.Name}, 'shuffle')));
             D = TEA(h, SR, true).read();
             tc.verifyClass(D, 'int32');
             tc.verifyEqual(D, counts);

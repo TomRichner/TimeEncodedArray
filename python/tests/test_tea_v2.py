@@ -477,5 +477,12 @@ class TestStorageClasses:
         dc, _, _ = f.stream(10).read()
         np.testing.assert_array_equal(dc, x_c)
         with h5py.File(path, 'r') as h:
+            # Compressed: shuffle for the integer stream only
             assert h['rates/r1/Samples'].compression == 'gzip'
+            assert h['rates/r1/Samples'].shuffle is True
+            assert h['rates/r1/t'].shuffle is False
+            assert h['rates/r2/Samples'].compression == 'gzip'
+            assert h['rates/r2/Samples'].shuffle is False
+            assert h['rates/r3/Samples'].shuffle is False
             assert 'scale' not in h  # several streams: nothing linked at the top
+        assert tea.compression_kwargs(False, np.int32) == {}

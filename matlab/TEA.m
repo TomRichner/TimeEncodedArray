@@ -1251,15 +1251,17 @@ classdef TEA < handle
             else
                 deflate_level = 0;
             end
-            % No shuffle filter: sampled data is usually integer ADC counts
-            % times a scale factor, so whole 8-byte values repeat and DEFLATE
-            % finds them. Shuffle splits those values into byte lanes and
-            % hides the repeats (measured on EEG: 2.4x larger files and slower).
+            % Shuffle filter for integer classes only (same rule as python/tea.py
+            % compression_kwargs): on int32 EEG counts it gave 25-28 % smaller
+            % files and faster writes and reads; on double physical values it
+            % hides the repeated 8-byte patterns DEFLATE finds (1.6x larger).
+            is_int = any(strcmpi(var_class, {'int8', 'int16', 'int32', 'int64', ...
+                'uint8', 'uint16', 'uint32', 'uint64'}));
             h5create(filename, varname, [Inf, Inf], ...
                 'DataType', var_class, ...
                 'ChunkSize', [chunk_rows, chunk_cols], ...
                 'Deflate', deflate_level, ...
-                'Shuffle', false);
+                'Shuffle', do_compress && is_int);
 
             fid = H5F.open(filename, 'H5F_ACC_RDWR', 'H5P_DEFAULT');
             dset_id = H5D.open(fid, varname);
