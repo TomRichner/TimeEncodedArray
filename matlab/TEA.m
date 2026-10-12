@@ -7,15 +7,24 @@ classdef TEA < handle
 %   Construction:
 %       tea = TEA(file_path, SR, isRegular)
 %       tea = TEA(file_path, SR, isRegular, 't_units', 's', 'hdr', hdr_struct)
+%       tea = TEA(file_path, SR, isRegular, 'scale', [0.1 0.5], 'offset', [0 -2])
 %
 %       If the file already exists, the constructor opens it and validates
 %       that SR/isRegular match. If it doesn't exist, properties are stored
 %       and the file is created on the first write.
 %
+%   Storage class: Samples is stored as the class given to write (double,
+%   single, int16, int32 or int64). Integer Samples are counts; with the
+%   'scale'/'offset' options (one value or one per channel, integer classes
+%   only) physical = double(Samples) .* scale + offset, and read() returns
+%   physical double values by default. read(..., 'DataType', 'single' |
+%   'double' | 'int') picks the form; without scale the data comes back as
+%   stored unless a DataType is asked for.
+%
 %   Methods:
 %       write(t, Samples)           — Append time-series data
 %       write_channels(Samples, ch_map) — Append new channels
-%       [D,t,disc] = read(channels, t_range, s_range) — Read data
+%       [D,t,disc] = read(channels, t_range, s_range, 'DataType', dt) — Read data
 %       refresh()                   — Recompute dependent variables
 %       s = info()                  — Return file metadata summary
 %       st = stream(rate)           — Read-only TEAStream of one sample rate
@@ -51,6 +60,8 @@ classdef TEA < handle
     end
 
     properties (SetAccess = private)
+        scale  double = []   % [1 x C] counts-to-physical factor of an integer file, [] when unscaled
+        offset double = []   % [1 x C] offset added after scaling, [] when unscaled
         is_initialized logical = false  % true after file has datasets
         expected_length  double = []    % pre-allocation target for N
         expected_channels double = []   % pre-allocation target for C
@@ -86,6 +97,8 @@ classdef TEA < handle
             addParameter(p, 'compress', false, @(x) islogical(x) && isscalar(x));
             addParameter(p, 'expected_length', [], @(x) isempty(x) || (isscalar(x) && x > 0));
             addParameter(p, 'expected_channels', [], @(x) isempty(x) || (isscalar(x) && x > 0));
+            addParameter(p, 'scale', [], @(x) isempty(x) || (isnumeric(x) && isvector(x)));
+            addParameter(p, 'offset', [], @(x) isempty(x) || (isnumeric(x) && isvector(x)));
             parse(p, file_path, SR, isRegular, varargin{:});
 
             % Validate SR
@@ -111,6 +124,17 @@ classdef TEA < handle
             obj.compress = p.Results.compress;
             obj.expected_length = p.Results.expected_length;
             obj.expected_channels = p.Results.expected_channels;
+            obj.scale = double(p.Results.scale(:)');
+            obj.offset = double(p.Results.offset(:)');
+            if ~isempty(obj.offset) && isempty(obj.scale)
+                obj.scale = ones(size(obj.offset));
+            end
+            if ~isempty(obj.scale)
+                if isempty(obj.offset), obj.offset = zeros(size(obj.scale)); end
+                if ~all(isfinite(obj.scale)) || any(obj.scale == 0) || ~all(isfinite(obj.offset))
+                    error('TEA:InvalidScale', 'scale must be finite and non-zero, offset finite.');
+                end
+            end
 
             % Warn if t_units != 's' on new file
             if ~exist(file_path, 'file') && ~isempty(obj.t_units) && ~strcmp(obj.t_units, 's')
@@ -139,6 +163,20 @@ classdef TEA < handle
 
                 % Check if datasets exist
                 obj.is_initialized = ismember('t', vars) && ismember('Samples', vars);
+
+                % Scale and offset come from the file; a constructor value must agree
+                if obj.is_initialized
+                    [fs, fo] = TEA.read_scaling(file_path, '/');
+                    if ~isempty(obj.scale)
+                        C_file = obj.C;
+                        [s_in, o_in] = TEA.broadcast_scaling(obj.scale, obj.offset, C_file);
+                        if isempty(fs) || ~isequal(s_in, fs) || ~isequal(o_in, fo)
+                            error('TEA:ScaleMismatch', 'scale/offset mismatch with the existing file.');
+                        end
+                    end
+                    obj.scale = fs;
+                    obj.offset = fo;
+                end
             end
         end
 
@@ -301,6 +339,13 @@ classdef TEA < handle
 
             if ~obj.is_initialized
                 % --- First write: create file ---
+                if ~isempty(obj.scale)
+                    if ~isinteger(Samples)
+                        error('TEA:ScaleNeedsInteger', ...
+                            'scale/offset need integer Samples (counts), not %s.', class(Samples));
+                    end
+                    [obj.scale, obj.offset] = TEA.broadcast_scaling(obj.scale, obj.offset, C_new);
+                end
                 obj.init(N_new, C_new, class(Samples));
 
                 % Write data via h5write with start/count (handles pre-allocated datasets)
@@ -323,6 +368,10 @@ classdef TEA < handle
                     mf.t_offset = obj.t_offset;
                     mf.t_offset_units = obj.t_offset_units;
                     mf.t_offset_scale = obj.t_offset_scale;
+                end
+                if ~isempty(obj.scale)
+                    mf.scale = obj.scale;     % [1 x C]
+                    mf.offset = obj.offset;   % [1 x C]
                 end
                 if ~isempty(fieldnames(obj.hdr))
                     mf.hdr = obj.hdr;
@@ -403,6 +452,15 @@ classdef TEA < handle
                 error('TEA:NotInitialized', 'Cannot append channels before any data has been written.');
             end
             obj.refuse_v2_write();
+            if ~isempty(obj.scale)
+                error('TEA:ScaledFile', ...
+                    'write_channels is not supported on a file with per-channel scale/offset.');
+            end
+            stored_class = obj.samples_class();
+            if ~strcmp(class(Samples), stored_class)
+                error('TEA:ClassMismatch', 'New channels must be %s like the file, not %s.', ...
+                    stored_class, class(Samples));
+            end
 
             if nargin < 3, new_ch_map = []; end
 
@@ -508,22 +566,27 @@ classdef TEA < handle
         end
 
         %% ============ READ ============
-        function [Data, t_out, disc_info] = read(obj, channels, t_range, s_range, data_var_name)
+        function [Data, t_out, disc_info] = read(obj, channels, t_range, s_range, varargin)
         % READ Read data from the TEA file.
         %
         %   [Data, t_out] = tea.read(channels, t_range, s_range)
         %   [Data, t_out, disc_info] = tea.read(...)
+        %   [Data, t_out] = tea.read(channels, t_range, s_range, 'DataType', 'single')
         %
         %   Inputs:
         %       channels  - Channel numbers (uses ch_map). [] for all.
         %       t_range   - [start, end] in t units. [] to skip.
         %       s_range   - [start, end] sample indices. [] to skip.
-        %       data_var_name - (optional) Variable name, default 'Samples'
+        %       data_var_name - (optional, 5th positional) Variable name, default 'Samples'
+        %       'DataType', dt - '' (default): physical double when the file has
+        %                 scale, else as stored; 'double' or 'single': physical
+        %                 values in that class; 'int': the stored counts (an
+        %                 error for a floating file).
 
             if nargin < 2, channels = []; end
             if nargin < 3, t_range = []; end
             if nargin < 4, s_range = []; end
-            if nargin < 5 || isempty(data_var_name), data_var_name = 'Samples'; end
+            [data_var_name, data_type] = TEA.parse_read_options(varargin);
             is_loading_samples = strcmp(data_var_name, 'Samples');
 
             if ~isempty(t_range) && ~isempty(s_range)
@@ -586,6 +649,16 @@ classdef TEA < handle
                 [Data, t_out] = obj.load_by_time_range(mf, t_range, channel_indices, data_var_name, total_samples, info, is_loading_samples, file_vars);
             end
 
+            % --- Scale (integer counts to physical) and requested class ---
+            if is_loading_samples
+                [sc, of] = TEA.read_scaling(obj.file_path, '/');
+                if ~isempty(sc) && ~ischar(channel_indices)
+                    sc = sc(channel_indices);
+                    of = of(channel_indices);
+                end
+                Data = TEA.apply_scale(Data, sc, of, data_type);
+            end
+
             % --- Discontinuity info ---
             if nargout >= 3
                 disc_info = obj.compute_disc_info(mf, t_out, file_vars);
@@ -628,6 +701,8 @@ classdef TEA < handle
             s.t_offset = obj.t_offset;
             s.t_offset_units = obj.t_offset_units;
             s.t_offset_scale = obj.t_offset_scale;
+            s.dtype = obj.samples_class();
+            s.scaled = ~isempty(obj.scale);
 
             if exist(obj.file_path, 'file') == 2
                 mf = matfile(obj.file_path);
@@ -647,6 +722,14 @@ classdef TEA < handle
 
     %% ============ PRIVATE METHODS ============
     methods (Access = private)
+
+        function c = samples_class(obj)
+        % Storage class of Samples ('double' for a file not yet created).
+            c = 'double';
+            if exist(obj.file_path, 'file') == 2 && obj.is_initialized
+                c = TEA.class_of_dataset(obj.file_path, '/Samples');
+            end
+        end
 
         function refuse_v2_write(obj)
             if exist(obj.file_path, 'file') == 2 && obj.schema_version >= 2
@@ -1008,9 +1091,139 @@ classdef TEA < handle
             per_sample = max(1, n_channels) * itemsize;
             n = min(8192, max(64, floor(target_bytes / per_sample)));
         end
+
+        function Data = apply_scale(Data, scale, offset, data_type)
+        % APPLY_SCALE Return a read window in the requested form.
+        %   Data = TEA.apply_scale(Data, scale, offset, data_type)
+        %   scale/offset: [] when the stream is unscaled, else one value per
+        %   column of Data. data_type: '' (physical double when scaled, else
+        %   as stored), 'double' or 'single' (physical in that class), 'int'
+        %   (the stored counts; an error for floating Data), or an integer
+        %   class name (counts cast to it).
+            if nargin < 4 || isempty(data_type), data_type = ''; end
+            dt = lower(char(data_type));
+            switch dt
+                case {'', 'double', 'single'}
+                    % handled below
+                case {'int', 'counts', 'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'}
+                    if ~isinteger(Data)
+                        error('TEA:NotCounts', 'The data holds %s samples, not integer counts.', class(Data));
+                    end
+                    if ~any(strcmp(dt, {'int', 'counts'})) && ~strcmp(dt, class(Data))
+                        Data = cast(Data, dt);
+                    end
+                    return;
+                otherwise
+                    error('TEA:InvalidDataType', ...
+                        'DataType must be ''double'', ''single'' or ''int'', not ''%s''.', dt);
+            end
+            if isempty(scale)
+                if ~isempty(dt) && ~strcmp(dt, class(Data)), Data = cast(Data, dt); end
+                return;
+            end
+            Data = double(Data) .* reshape(scale, 1, []) + reshape(offset, 1, []);
+            if strcmp(dt, 'single'), Data = single(Data); end
+        end
+
+        function c = class_of_dataset(file_path, path)
+        % CLASS_OF_DATASET MATLAB class of an HDF5 dataset ('double', 'int32', ...).
+            info = h5info(file_path, path);
+            type = info.Datatype.Type;
+            if ~ischar(type), type = 'H5T_IEEE_F64LE'; end
+            tok = regexp(type, 'H5T_(?:IEEE|STD)_([FIU])(\d+)[BL]E', 'tokens', 'once');
+            if isempty(tok)
+                c = 'double';
+                return;
+            end
+            bits = str2double(tok{2});
+            switch tok{1}
+                case 'F'
+                    if bits == 32, c = 'single'; else, c = 'double'; end
+                case 'I'
+                    c = sprintf('int%d', bits);
+                otherwise
+                    c = sprintf('uint%d', bits);
+            end
+        end
+
+        function [scale, offset] = read_scaling(file_path, group)
+        % READ_SCALING [1 x C] scale and offset of a stream group, [] when unscaled.
+        %   Only an integer Samples dataset carries them; a stray pair on a
+        %   floating one is ignored with a warning.
+            scale = []; offset = [];
+            if strcmp(group, '/'), pre = ''; else, pre = group; end
+            if ~TEA.h5_exists(file_path, [pre '/scale']), return; end
+            c = TEA.class_of_dataset(file_path, [pre '/Samples']);
+            if ~startsWith(c, 'int') && ~startsWith(c, 'uint')
+                warning('TEA:ScaleIgnored', '%s:%s/scale on %s Samples ignored.', file_path, pre, c);
+                return;
+            end
+            scale = double(h5read(file_path, [pre '/scale']));
+            scale = scale(:)';
+            if TEA.h5_exists(file_path, [pre '/offset'])
+                offset = double(h5read(file_path, [pre '/offset']));
+                offset = offset(:)';
+            else
+                offset = zeros(size(scale));
+            end
+            info = h5info(file_path, [pre '/Samples']);
+            C = info.Dataspace.Size(2);
+            if numel(scale) ~= C || numel(offset) ~= C
+                error('TEA:BadScale', '%s: scale/offset have %d/%d values for %d channels.', ...
+                    file_path, numel(scale), numel(offset), C);
+            end
+        end
+
+        function [scale, offset] = broadcast_scaling(scale, offset, C)
+        % BROADCAST_SCALING Expand scalar scale/offset to [1 x C]; check lengths.
+            scale = double(scale(:)');
+            if isempty(offset), offset = 0; end
+            offset = double(offset(:)');
+            if isscalar(scale), scale = repmat(scale, 1, C); end
+            if isscalar(offset), offset = repmat(offset, 1, C); end
+            if numel(scale) ~= C || numel(offset) ~= C
+                error('TEA:BadScale', 'scale/offset have %d/%d values for %d channels.', ...
+                    numel(scale), numel(offset), C);
+            end
+        end
     end
 
     methods (Static, Access = private)
+
+        function [data_var_name, data_type] = parse_read_options(args)
+        % Optional 5th positional data_var_name, then 'DataType', value pairs.
+            data_var_name = 'Samples';
+            data_type = '';
+            if ~isempty(args) && ischar(args{1}) && ~strcmpi(args{1}, 'DataType')
+                if ~isempty(args{1}), data_var_name = args{1}; end
+                args(1) = [];
+            end
+            if mod(numel(args), 2) ~= 0
+                error('TEA:InvalidOption', 'read options come as name-value pairs.');
+            end
+            for k = 1:2:numel(args)
+                if strcmpi(args{k}, 'DataType')
+                    data_type = char(args{k + 1});
+                else
+                    error('TEA:InvalidOption', 'Unknown read option ''%s''.', char(args{k}));
+                end
+            end
+        end
+
+        function tf = h5_exists(file_path, path)
+            fid = H5F.open(file_path, 'H5F_ACC_RDONLY', 'H5P_DEFAULT');
+            c = onCleanup(@() H5F.close(fid));
+            parts = strsplit(path(2:end), '/');
+            tf = true;
+            sofar = '';
+            for k = 1:numel(parts)
+                sofar = [sofar '/' parts{k}]; %#ok<AGROW>
+                if ~H5L.exists(fid, sofar, 'H5P_DEFAULT')
+                    tf = false;
+                    return;
+                end
+            end
+        end
 
         function h5_init_dataset(filename, var, sz, var_class, do_compress)
         % Create a chunked HDF5 dataset with unlimited max dimensions.
@@ -1093,12 +1306,17 @@ classdef TEA < handle
         end
 
         function Data = make_empty(info, channel_indices, is_loading_samples)
+            cls = 'double';
+            if isfield(info, 'class') && any(strcmp(info.class, ...
+                    {'double', 'single', 'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'}))
+                cls = info.class;
+            end
             if is_loading_samples && ~ischar(channel_indices)
-                Data = zeros(0, length(channel_indices));
+                Data = zeros(0, length(channel_indices), cls);
             elseif length(info.size) >= 2
-                Data = zeros(0, info.size(2));
+                Data = zeros(0, info.size(2), cls);
             else
-                Data = zeros(0, 1);
+                Data = zeros(0, 1, cls);
             end
         end
 

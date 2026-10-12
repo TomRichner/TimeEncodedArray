@@ -15,6 +15,13 @@ classdef TEAStream < handle
 %   version 1 file); or channel names as a cell array or string array.
 %   t_range:  [start, end] in t units (seconds relative to t_offset).
 %   s_range:  [first, last] sample indices, 1-based, inclusive.
+%   'DataType', dt (after s_range): '' (default) gives physical double when
+%   the stream has scale, else the samples as stored; 'double' or 'single'
+%   give physical values in that class; 'int' gives the stored counts.
+%
+%   dtype is the stored class ('double', 'single', 'int16', 'int32', 'int64');
+%   scale and offset ([1 x C], [] when unscaled) give
+%   physical = double(Samples) .* scale + offset; units is the physical unit.
 
     properties (SetAccess = private)
         file_path      char = ''
@@ -23,6 +30,9 @@ classdef TEAStream < handle
         isRegular      logical = true
         channel_names  cell = {}     % 1 x C cell of char
         units          cell = {}     % 1 x C cell of char ('' when unknown)
+        dtype          char = 'double'  % stored class of Samples
+        scale          double = []   % [1 x C] counts-to-physical factor, [] when unscaled
+        offset         double = []   % [1 x C] offset after scaling, [] when unscaled
         schema_version double = 1
         t_units        char = ''
         t_offset                     % absolute time = t_offset * t_offset_scale + t
@@ -50,6 +60,8 @@ classdef TEAStream < handle
             obj.rate = TEAStream.read_scalar(file_path, obj.p('SR'));
             ir = TEAStream.read_scalar(file_path, obj.p('isRegular'));
             if ~isempty(ir), obj.isRegular = logical(ir); end
+            obj.dtype = TEA.class_of_dataset(file_path, obj.p('Samples'));
+            [obj.scale, obj.offset] = TEA.read_scaling(file_path, group);
 
             C = obj.C;
             if strcmp(group, '/')
@@ -75,12 +87,24 @@ classdef TEAStream < handle
             val = sz(2);
         end
 
-        function [Data, t_out, disc_info] = read(obj, channels, t_range, s_range)
+        function [Data, t_out, disc_info] = read(obj, channels, t_range, s_range, varargin)
         % READ Read samples of this stream.
         %   [Data, t_out, disc_info] = s.read(channels, t_range, s_range)
+        %   [Data, t_out] = s.read(channels, t_range, s_range, 'DataType', 'int')
             if nargin < 2, channels = []; end
             if nargin < 3, t_range = []; end
             if nargin < 4, s_range = []; end
+            data_type = '';
+            if mod(numel(varargin), 2) ~= 0
+                error('TEA:InvalidOption', 'read options come as name-value pairs.');
+            end
+            for k = 1:2:numel(varargin)
+                if strcmpi(varargin{k}, 'DataType')
+                    data_type = char(varargin{k + 1});
+                else
+                    error('TEA:InvalidOption', 'Unknown read option ''%s''.', char(varargin{k}));
+                end
+            end
             if ~isempty(t_range) && ~isempty(s_range)
                 error('TEA:RangeConflict', 'Specify either t_range or s_range, not both.');
             end
@@ -101,13 +125,18 @@ classdef TEAStream < handle
             end
 
             if NN == 0 || s1 < s0
-                Data = zeros(0, numel(idx));
+                Data = zeros(0, numel(idx), obj.dtype);
                 t_out = zeros(0, 1);
             else
                 n = s1 - s0 + 1;
                 t_out = h5read(obj.file_path, obj.p('t'), [s0 1], [n 1]);
                 Data = h5read(obj.file_path, obj.p('Samples'), [s0 1], [n C]);
                 Data = Data(:, idx);
+            end
+            if isempty(obj.scale)
+                Data = TEA.apply_scale(Data, [], [], data_type);
+            else
+                Data = TEA.apply_scale(Data, obj.scale(idx), obj.offset(idx), data_type);
             end
 
             if nargout >= 3
@@ -121,6 +150,7 @@ classdef TEAStream < handle
                 'rate', obj.rate, 'SR', obj.rate, 'isRegular', obj.isRegular, ...
                 'N', obj.N, 'C', obj.C, 'channel_names', {obj.channel_names}, ...
                 'units', {obj.units}, 'schema_version', obj.schema_version, ...
+                'dtype', obj.dtype, 'scaled', ~isempty(obj.scale), ...
                 't_units', obj.t_units, 't_offset', obj.t_offset, ...
                 't_offset_units', obj.t_offset_units, 't_offset_scale', obj.t_offset_scale);
             ic = TEAStream.read_scalar(obj.file_path, obj.p('isContinuous'));
