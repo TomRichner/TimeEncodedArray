@@ -32,3 +32,6 @@ desktop.ini
 .idea/
 
 *.agents
+
+# uv lockfile: TEA is a library, developed through eegreader's environment
+uv.lock
